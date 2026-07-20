@@ -105,13 +105,23 @@ class DiariZenRunner:
     def embed_moss_labels(
         self, audio_path: Path, moss_turns: list[Turn]
     ) -> dict[str, np.ndarray]:
-        """Mean-pool WeSpeaker embeddings over all crops for each local label."""
+        """Mean-pool WeSpeaker embeddings over all crops for each local label.
+
+        Skips zero-norm vectors (produced when a crop is too short) so that the
+        mean is taken only over valid embeddings.  Returns an empty dict when
+        ``moss_turns`` is empty, avoiding an unnecessary audio load.
+        """
+        if not moss_turns:
+            return {}
         wav, sr = load_mono16k(audio_path)
         assert sr == 16000
         by_label: dict[str, list[np.ndarray]] = {}
         for t in moss_turns:
             emb = self._embed_region(wav, t.start, t.end)
-            by_label.setdefault(t.speaker_id, []).append(emb)
+            # Skip zero vectors (too-short crop fallback) so they don't drag
+            # the mean toward the origin.
+            if np.any(emb != 0):
+                by_label.setdefault(t.speaker_id, []).append(emb)
         return {
             k: np.mean(np.stack(v, axis=0), axis=0).astype(np.float32)
             for k, v in by_label.items()
@@ -207,9 +217,9 @@ class DiariZenRunner:
         """
         import os
 
+        import torch
         import torchaudio
         from scipy.ndimage import median_filter
-        from pyannote.audio.utils.signal import Binarize
         from pyannote.database.protocol.protocol import ProtocolFile
 
         pipeline = self.pipeline
@@ -261,21 +271,23 @@ class DiariZenRunner:
         inactive_speakers = np.sum(binarized_segmentations.data, axis=1) == 0
         hard_clusters[inactive_speakers] = -2
 
-        # Parent reconstruct returns a single SlidingWindowFeature (upstream
-        # DiariZen __call__ incorrectly unpacks a 2-tuple).
-        discrete_diarization = pipeline.reconstruct(
+        # `reconstruct()` calls `to_diarization()` which returns
+        # (discrete_diarization, activations) — we only need the first.
+        discrete_diarization, _ = pipeline.reconstruct(
             segmentations,
             hard_clusters,
             count,
         )
 
-        to_annotation = Binarize(
-            onset=0.5,
-            offset=0.5,
+        # Use pipeline.to_annotation so rename_tracks(generator="string") is
+        # applied, matching what pyannote's apply() does (integer labels → "0",
+        # "1", …).  A bare Binarize() call leaves integer track labels which
+        # break downstream itertracks assumptions.
+        result = pipeline.to_annotation(
+            discrete_diarization,
             min_duration_on=0.0,
             min_duration_off=0.0,
         )
-        result = to_annotation(discrete_diarization)
         result.uri = sess_name
 
         if pipeline.rttm_out_dir is not None:
