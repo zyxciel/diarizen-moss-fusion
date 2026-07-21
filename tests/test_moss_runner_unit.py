@@ -93,7 +93,7 @@ def test_detect_incomplete_hit_max_tokens():
 
     turns = [Turn(0.0, 1100.0, "c000:S01", text="x")]
     incomplete, reason = detect_incomplete(
-        turns, 0.0, 1200.0, generated_tokens=16384, max_new_tokens=16384
+        turns, 0.0, 1200.0, generated_tokens=65536, max_new_tokens=65536
     )
     assert incomplete is True
     assert reason == "hit_max_new_tokens"

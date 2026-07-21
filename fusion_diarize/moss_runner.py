@@ -15,8 +15,9 @@ from fusion_diarize.types import AsrStatus, ChunkWindow, Source, Turn
 _WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 _MOSS_ROOT = _WORKSPACE_ROOT / "MOSS-Transcribe-Diarize-main"
 
-# 20-min chunks need a higher generation budget; 4096 often truncates.
-DEFAULT_MAX_NEW_TOKENS = 16384
+# MOSS README recommends 65536 for long multi-speaker audio (context max_length=131072).
+# Keep generation budget at the documented upper example so 20-min chunks do not truncate.
+DEFAULT_MAX_NEW_TOKENS = 65536
 # If last segment ends before this fraction of chunk duration → incomplete.
 INCOMPLETE_COVERAGE_RATIO = 0.85
 

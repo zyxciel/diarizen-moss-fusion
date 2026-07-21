@@ -57,7 +57,7 @@ fusion-diarize run \
 fusion-diarize eval --hyp /data/work/utt/mode_a.rttm --ref /data/ref/utt.rttm
 ```
 
-Defaults: MOSS chunks ≤ **20 minutes**, `max_new_tokens=16384`. Mode A now fills DiariZen into MOSS gaps and drops dual hypotheses that caused high FA.
+Defaults: MOSS chunks ≤ **20 minutes**, `max_new_tokens=65536` (MOSS long-audio recommendation). Mode A fills DiariZen into MOSS gaps and drops dual hypotheses that caused high FA.
 
 Eval prints a JSON summary: `der`, `false_alarm`, `missed_detection`, `confusion`, `collar`. Check `mode_a.json` → `meta.n_incomplete_moss_chunks` if miss is still high.
 
