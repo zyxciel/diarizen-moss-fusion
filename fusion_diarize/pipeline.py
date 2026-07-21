@@ -8,7 +8,13 @@ from typing import Any
 import numpy as np
 
 from fusion_diarize.audio_prep import load_mono16k, probe_duration, write_mono16k_wav
-from fusion_diarize.chunk_planner import plan_chunks
+from fusion_diarize.chunk_planner import (
+    DEFAULT_HARD_CAP,
+    DEFAULT_OVERLAP,
+    DEFAULT_TARGET_MAX,
+    DEFAULT_TARGET_MIN,
+    plan_chunks,
+)
 from fusion_diarize.export import read_json, write_json, write_rttm
 from fusion_diarize.fuse_a import fuse_mode_a
 from fusion_diarize.fuse_b import fuse_mode_b
@@ -20,6 +26,9 @@ from fusion_diarize.mapper import (
     remap_turns,
 )
 from fusion_diarize.types import ChunkWindow, DiarResult, Turn
+
+# Bump when chunk defaults change so stale work_dir caches are rebuilt.
+CHUNK_PLAN_VERSION = "20min_v1"
 
 
 def _centroids_to_lists(centroids: dict[str, np.ndarray]) -> dict[str, list[float]]:
@@ -33,21 +42,30 @@ def _centroids_from_lists(centroids: dict[str, Any]) -> dict[str, np.ndarray]:
     }
 
 
-def _save_chunks(path: Path, chunks: list[ChunkWindow]) -> None:
-    payload = [
-        {
-            "start": c.start,
-            "end": c.end,
-            "high_speaker_density": c.high_speaker_density,
-            "n_local_speakers": c.n_local_speakers,
-        }
-        for c in chunks
-    ]
+def _save_chunks(path: Path, chunks: list[ChunkWindow], *, version: str) -> None:
+    payload = {
+        "version": version,
+        "chunks": [
+            {
+                "start": c.start,
+                "end": c.end,
+                "high_speaker_density": c.high_speaker_density,
+                "n_local_speakers": c.n_local_speakers,
+            }
+            for c in chunks
+        ],
+    }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _load_chunks(path: Path) -> list[ChunkWindow]:
+def _load_chunks(path: Path, *, expected_version: str) -> list[ChunkWindow] | None:
+    """Return chunks if cache version matches; else None (force replan)."""
     payload = json.loads(path.read_text(encoding="utf-8"))
+    # Legacy list format (pre-version) → invalidate
+    if isinstance(payload, list):
+        return None
+    if payload.get("version") != expected_version:
+        return None
     return [
         ChunkWindow(
             float(c["start"]),
@@ -55,7 +73,7 @@ def _load_chunks(path: Path) -> list[ChunkWindow]:
             bool(c.get("high_speaker_density", False)),
             int(c.get("n_local_speakers", 0)),
         )
-        for c in payload
+        for c in payload.get("chunks", [])
     ]
 
 
@@ -92,6 +110,26 @@ def _per_label_confidence(
     return conf
 
 
+def _filter_moss_on_failed_chunks(
+    moss_turns: list[Turn], moss_meta: list[dict]
+) -> list[Turn]:
+    """Drop MOSS turns from failed chunks; keep incomplete turns (DiariZen fills gaps)."""
+    failed_spans = [
+        (float(m["start"]), float(m["end"]))
+        for m in moss_meta
+        if not m.get("ok", True)
+    ]
+    if not failed_spans:
+        return moss_turns
+    kept: list[Turn] = []
+    for t in moss_turns:
+        mid = 0.5 * (t.start + t.end)
+        if any(a <= mid <= b for a, b in failed_spans):
+            continue
+        kept.append(t)
+    return kept
+
+
 def run_pipeline(
     audio: Path,
     work_dir: Path,
@@ -99,6 +137,12 @@ def run_pipeline(
     diarizen_runner,  # duck-typed: .run(path)->(turns, centroids), .embed_moss_labels(path, turns)->dict
     moss_runner,  # .run_chunks(audio, chunks, moss_dir)->(turns, meta)
     tau: float = 0.6,
+    *,
+    target_min: float = DEFAULT_TARGET_MIN,
+    target_max: float = DEFAULT_TARGET_MAX,
+    hard_cap: float = DEFAULT_HARD_CAP,
+    overlap: float = DEFAULT_OVERLAP,
+    force_rechunk: bool = False,
 ) -> dict[str, Path]:
     if mode not in ("a", "b", "both"):
         raise ValueError(f"mode must be 'a', 'b', or 'both'; got {mode!r}")
@@ -129,30 +173,64 @@ def run_pipeline(
         )
 
     chunks_path = work_dir / "chunks.json"
-    if chunks_path.is_file():
-        chunks = _load_chunks(chunks_path)
-    else:
+    moss_turns_path = work_dir / "moss_turns.json"
+    chunks: list[ChunkWindow] | None = None
+    if chunks_path.is_file() and not force_rechunk:
+        chunks = _load_chunks(chunks_path, expected_version=CHUNK_PLAN_VERSION)
+    if chunks is None:
         duration = probe_duration(prepared)
-        chunks = plan_chunks(diarizen_turns, duration)
-        _save_chunks(chunks_path, chunks)
+        chunks = plan_chunks(
+            diarizen_turns,
+            duration,
+            target_min=target_min,
+            target_max=target_max,
+            hard_cap=hard_cap,
+            overlap=overlap,
+        )
+        _save_chunks(chunks_path, chunks, version=CHUNK_PLAN_VERSION)
+        # Chunk plan changed → invalidate cached MOSS
+        if moss_turns_path.is_file():
+            moss_turns_path.unlink()
 
     moss_dir = work_dir / "moss"
-    moss_turns_path = work_dir / "moss_turns.json"
-    if moss_turns_path.is_file():
+    if moss_turns_path.is_file() and not force_rechunk:
         moss_turns, moss_meta = _load_moss(moss_turns_path)
     else:
         moss_turns, moss_meta = moss_runner.run_chunks(prepared, chunks, moss_dir)
         _save_moss(moss_turns_path, moss_turns, moss_meta)
+
+    moss_turns = _filter_moss_on_failed_chunks(moss_turns, moss_meta)
 
     moss_emb = diarizen_runner.embed_moss_labels(prepared, moss_turns)
     mapping = map_moss_speakers(moss_turns, diarizen_turns, moss_emb, centroids)
     confidences = _per_label_confidence(
         mapping, moss_turns, diarizen_turns, moss_emb, centroids
     )
+    # Lower confidence for speakers whose MOSS evidence mostly sits in incomplete chunks
+    incomplete_spans = [
+        (float(m["start"]), float(m["end"]))
+        for m in moss_meta
+        if m.get("incomplete")
+    ]
+    if incomplete_spans:
+        for loc, glob in mapping.items():
+            loc_turns = [t for t in moss_turns if t.speaker_id == loc]
+            if not loc_turns:
+                continue
+            in_incomplete = 0
+            for t in loc_turns:
+                mid = 0.5 * (t.start + t.end)
+                if any(a <= mid <= b for a, b in incomplete_spans):
+                    in_incomplete += 1
+            if in_incomplete / len(loc_turns) >= 0.5:
+                confidences[glob] = min(confidences.get(glob, 0.0), tau - 1e-3)
+
     moss_remapped = remap_turns(moss_turns, mapping)
 
     uri = audio.stem
     outs: dict[str, Path] = {}
+    n_incomplete = sum(1 for m in moss_meta if m.get("incomplete"))
+    n_failed = sum(1 for m in moss_meta if not m.get("ok", True))
 
     if mode in ("a", "both"):
         fused_a = fuse_mode_a(diarizen_turns, moss_remapped, confidences, tau=tau)
@@ -168,6 +246,10 @@ def run_pipeline(
                     "mapping": mapping,
                     "confidences": confidences,
                     "moss_chunk_meta": moss_meta,
+                    "chunk_plan_version": CHUNK_PLAN_VERSION,
+                    "n_chunks": len(chunks),
+                    "n_incomplete_moss_chunks": n_incomplete,
+                    "n_failed_moss_chunks": n_failed,
                 },
             ),
             json_a,
@@ -188,6 +270,10 @@ def run_pipeline(
                     "mapping": mapping,
                     "confidences": confidences,
                     "moss_chunk_meta": moss_meta,
+                    "chunk_plan_version": CHUNK_PLAN_VERSION,
+                    "n_chunks": len(chunks),
+                    "n_incomplete_moss_chunks": n_incomplete,
+                    "n_failed_moss_chunks": n_failed,
                 },
             ),
             json_b,

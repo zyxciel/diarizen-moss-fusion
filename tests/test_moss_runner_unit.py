@@ -79,6 +79,35 @@ def test_fake_moss_runner_run_chunks_ok_meta(tmp_path: Path):
     assert work.is_dir()
 
 
+def test_detect_incomplete_low_coverage():
+    from fusion_diarize.moss_runner import detect_incomplete
+
+    turns = [Turn(0.0, 100.0, "c000:S01", text="x")]
+    incomplete, reason = detect_incomplete(turns, 0.0, 1200.0)
+    assert incomplete is True
+    assert "low_coverage" in reason
+
+
+def test_detect_incomplete_hit_max_tokens():
+    from fusion_diarize.moss_runner import detect_incomplete
+
+    turns = [Turn(0.0, 1100.0, "c000:S01", text="x")]
+    incomplete, reason = detect_incomplete(
+        turns, 0.0, 1200.0, generated_tokens=16384, max_new_tokens=16384
+    )
+    assert incomplete is True
+    assert reason == "hit_max_new_tokens"
+
+
+def test_detect_complete_ok():
+    from fusion_diarize.moss_runner import detect_incomplete
+
+    turns = [Turn(0.0, 1150.0, "c000:S01", text="x")]
+    incomplete, reason = detect_incomplete(turns, 0.0, 1200.0)
+    assert incomplete is False
+    assert reason == ""
+
+
 def test_moss_runner_module_imports_without_loading_model():
     """Importing the module must not load transformers / HF models."""
     import fusion_diarize.moss_runner as mod
@@ -86,3 +115,4 @@ def test_moss_runner_module_imports_without_loading_model():
     assert hasattr(mod, "MossRunner")
     assert hasattr(mod, "FakeMossRunner")
     assert hasattr(mod, "segments_to_turns")
+    assert hasattr(mod, "detect_incomplete")

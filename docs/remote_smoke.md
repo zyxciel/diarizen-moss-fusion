@@ -40,19 +40,26 @@ pip install -e ".[dev]"
 | MOSS | `OpenMOSS-Team/MOSS-Transcribe-Diarize` or a local checkpoint path |
 
 ```bash
+# IMPORTANT: after pulling fusion fixes, delete old work-dir caches so chunks
+# are re-planned at 20 min (stale 30–60 min chunks cause MOSS truncation).
+rm -rf /data/work/utt/chunks.json /data/work/utt/moss_turns.json /data/work/utt/moss
+
 fusion-diarize run \
   --audio /data/utt.wav \
   --work-dir /data/work/utt \
-  --mode both \
+  --mode a \
   --diarizen-repo BUT-FIT/diarizen-wavlm-large-s80-md \
-  --moss-model /models/MOSS-Transcribe-Diarize
+  --moss-model /models/MOSS-Transcribe-Diarize \
+  --chunk-max 1200 \
+  --force-rechunk
 
-# Mode A / Mode B RTTMs under the work dir
+# Mode A RTTM under the work dir (preferred experimentally)
 fusion-diarize eval --hyp /data/work/utt/mode_a.rttm --ref /data/ref/utt.rttm
-fusion-diarize eval --hyp /data/work/utt/mode_b.rttm --ref /data/ref/utt.rttm
 ```
 
-Eval prints a JSON summary: `der`, `false_alarm`, `missed_detection`, `confusion`, `collar`.
+Defaults: MOSS chunks ≤ **20 minutes**, `max_new_tokens=16384`. Mode A now fills DiariZen into MOSS gaps and drops dual hypotheses that caused high FA.
+
+Eval prints a JSON summary: `der`, `false_alarm`, `missed_detection`, `confusion`, `collar`. Check `mode_a.json` → `meta.n_incomplete_moss_chunks` if miss is still high.
 
 ## 5. Baselines (ablation)
 

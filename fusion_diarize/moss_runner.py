@@ -15,6 +15,11 @@ from fusion_diarize.types import AsrStatus, ChunkWindow, Source, Turn
 _WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 _MOSS_ROOT = _WORKSPACE_ROOT / "MOSS-Transcribe-Diarize-main"
 
+# 20-min chunks need a higher generation budget; 4096 often truncates.
+DEFAULT_MAX_NEW_TOKENS = 16384
+# If last segment ends before this fraction of chunk duration → incomplete.
+INCOMPLETE_COVERAGE_RATIO = 0.85
+
 
 def _ensure_moss_on_path() -> None:
     """Insert vendored MOSS package root onto ``sys.path``."""
@@ -54,6 +59,34 @@ def segments_to_turns(
     return turns
 
 
+def detect_incomplete(
+    turns: list[Turn],
+    chunk_start: float,
+    chunk_end: float,
+    *,
+    generated_tokens: int | None = None,
+    max_new_tokens: int | None = None,
+    coverage_ratio: float = INCOMPLETE_COVERAGE_RATIO,
+) -> tuple[bool, str]:
+    """Heuristic for truncated / incomplete MOSS output on a chunk.
+
+    Returns ``(incomplete, reason)``.
+    """
+    dur = chunk_end - chunk_start
+    if dur <= 0:
+        return False, ""
+    if generated_tokens is not None and max_new_tokens is not None:
+        if generated_tokens >= max_new_tokens:
+            return True, "hit_max_new_tokens"
+    if not turns:
+        return True, "empty_output"
+    last_end = max(t.end for t in turns)
+    covered = last_end - chunk_start
+    if covered < coverage_ratio * dur:
+        return True, f"low_coverage:{covered / dur:.2f}"
+    return False, ""
+
+
 class MossRunner:
     """Lazy-loads MOSS HF model/processor; transcribes chunk WAVs to Turns."""
 
@@ -61,7 +94,7 @@ class MossRunner:
         self,
         model_path: str,
         device: str = "auto",
-        max_new_tokens: int = 4096,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ):
         self.model_path = model_path
         self.device = device
@@ -100,8 +133,8 @@ class MossRunner:
         chunk_wav: Path,
         time_offset: float,
         chunk_index: int | None = None,
-    ) -> list[Turn]:
-        """Transcribe one chunk; if ``chunk_index`` is set, prefix speakers ``cXXX:``."""
+    ) -> tuple[list[Turn], dict[str, Any]]:
+        """Transcribe one chunk; returns turns + generation diagnostics."""
         self._ensure_loaded()
         _ensure_moss_on_path()
         from moss_transcribe_diarize import parse_transcript
@@ -122,7 +155,12 @@ class MossRunner:
         )
         segs = parse_transcript(result["text"])
         prefix = f"c{chunk_index:03d}:" if chunk_index is not None else ""
-        return segments_to_turns(segs, time_offset, speaker_prefix=prefix)
+        turns = segments_to_turns(segs, time_offset, speaker_prefix=prefix)
+        diag = {
+            "generated_tokens": int(result.get("generated_tokens", 0)),
+            "max_new_tokens": self.max_new_tokens,
+        }
+        return turns, diag
 
     def run_chunks(
         self,
@@ -139,8 +177,15 @@ class MossRunner:
             chunk_path = work_dir / f"chunk_{i:03d}.wav"
             try:
                 slice_wav(full_audio, c.start, c.end, chunk_path)
-                turns = self.transcribe_chunk(
+                turns, diag = self.transcribe_chunk(
                     chunk_path, time_offset=c.start, chunk_index=i
+                )
+                incomplete, reason = detect_incomplete(
+                    turns,
+                    c.start,
+                    c.end,
+                    generated_tokens=diag.get("generated_tokens"),
+                    max_new_tokens=diag.get("max_new_tokens"),
                 )
                 all_turns.extend(turns)
                 meta.append(
@@ -150,6 +195,11 @@ class MossRunner:
                         "end": c.end,
                         "ok": True,
                         "high_speaker_density": c.high_speaker_density,
+                        "incomplete": incomplete,
+                        "incomplete_reason": reason,
+                        "n_turns": len(turns),
+                        "generated_tokens": diag.get("generated_tokens"),
+                        "max_new_tokens": diag.get("max_new_tokens"),
                     }
                 )
             except Exception as e:
@@ -161,6 +211,8 @@ class MossRunner:
                         "ok": False,
                         "error": str(e),
                         "high_speaker_density": c.high_speaker_density,
+                        "incomplete": True,
+                        "incomplete_reason": "exception",
                     }
                 )
         return all_turns, meta
@@ -186,6 +238,8 @@ class FakeMossRunner:
                 "end": c.end,
                 "ok": True,
                 "high_speaker_density": c.high_speaker_density,
+                "incomplete": False,
+                "incomplete_reason": "",
             }
             for i, c in enumerate(chunks)
         ]
