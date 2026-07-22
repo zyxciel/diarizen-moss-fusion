@@ -61,9 +61,9 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--work-dir", required=True, help="Cache / output directory")
     run.add_argument(
         "--mode",
-        choices=["a", "b", "both"],
-        default="a",
-        help="Fuse mode (default: a — preferred experimentally)",
+        choices=["a", "b", "c", "both"],
+        default="c",
+        help="Fuse mode (default: c — MOSS-primary with DiariZen guardrails)",
     )
     run.add_argument("--moss-model", required=True, help="MOSS model path")
     run.add_argument(

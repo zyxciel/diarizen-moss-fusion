@@ -18,6 +18,7 @@ from fusion_diarize.chunk_planner import (
 from fusion_diarize.export import read_json, write_json, write_rttm
 from fusion_diarize.fuse_a import fuse_mode_a
 from fusion_diarize.fuse_b import fuse_mode_b
+from fusion_diarize.fuse_c import fuse_mode_c
 from fusion_diarize.mapper import (
     _overlap,
     assignment_confidence,
@@ -133,7 +134,7 @@ def _filter_moss_on_failed_chunks(
 def run_pipeline(
     audio: Path,
     work_dir: Path,
-    mode: str,  # "a" | "b" | "both"
+    mode: str,  # "a" | "b" | "c" | "both"
     diarizen_runner,  # duck-typed: .run(path)->(turns, centroids), .embed_moss_labels(path, turns)->dict
     moss_runner,  # .run_chunks(audio, chunks, moss_dir)->(turns, meta)
     tau: float = 0.6,
@@ -144,8 +145,8 @@ def run_pipeline(
     overlap: float = DEFAULT_OVERLAP,
     force_rechunk: bool = False,
 ) -> dict[str, Path]:
-    if mode not in ("a", "b", "both"):
-        raise ValueError(f"mode must be 'a', 'b', or 'both'; got {mode!r}")
+    if mode not in ("a", "b", "c", "both"):
+        raise ValueError(f"mode must be 'a', 'b', 'c', or 'both'; got {mode!r}")
 
     audio = Path(audio)
     work_dir = Path(work_dir)
@@ -280,5 +281,35 @@ def run_pipeline(
         )
         outs["mode_b.rttm"] = rttm_b
         outs["mode_b.json"] = json_b
+
+    if mode in ("c", "both"):
+        fused_c, fuse_c_meta = fuse_mode_c(
+            diarizen_turns,
+            moss_turns,
+            moss_remapped,
+            moss_meta,
+        )
+        rttm_c = work_dir / "mode_c.rttm"
+        json_c = work_dir / "mode_c.json"
+        write_rttm(fused_c, rttm_c, uri=uri)
+        write_json(
+            DiarResult(
+                turns=fused_c,
+                meta={
+                    "mode": "c",
+                    "mapping": mapping,
+                    "confidences": confidences,
+                    "moss_chunk_meta": moss_meta,
+                    "chunk_plan_version": CHUNK_PLAN_VERSION,
+                    "n_chunks": len(chunks),
+                    "n_incomplete_moss_chunks": n_incomplete,
+                    "n_failed_moss_chunks": n_failed,
+                    **fuse_c_meta,
+                },
+            ),
+            json_c,
+        )
+        outs["mode_c.rttm"] = rttm_c
+        outs["mode_c.json"] = json_c
 
     return outs

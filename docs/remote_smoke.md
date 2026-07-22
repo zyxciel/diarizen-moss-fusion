@@ -30,7 +30,7 @@ cd /data/diarizen+moss
 pip install -e ".[dev]"
 ```
 
-## 4. Example fusion-diarize run + eval (`--mode both`)
+## 4. Example fusion-diarize run + eval (default `--mode c`)
 
 **Models**
 
@@ -47,19 +47,27 @@ rm -rf /data/work/utt/chunks.json /data/work/utt/moss_turns.json /data/work/utt/
 fusion-diarize run \
   --audio /data/utt.wav \
   --work-dir /data/work/utt \
-  --mode a \
+  --mode c \
   --diarizen-repo BUT-FIT/diarizen-wavlm-large-s80-md \
   --moss-model /models/MOSS-Transcribe-Diarize \
   --chunk-max 1200 \
   --force-rechunk
 
-# Mode A RTTM under the work dir (preferred experimentally)
-fusion-diarize eval --hyp /data/work/utt/mode_a.rttm --ref /data/ref/utt.rttm
+# Mode C RTTM under the work dir (default; MOSS-primary + DiariZen guardrails)
+fusion-diarize eval --hyp /data/work/utt/mode_c.rttm --ref /data/ref/utt.rttm
 ```
 
-Defaults: MOSS chunks ≤ **20 minutes**, `max_new_tokens=65536` (MOSS long-audio recommendation). Mode A fills DiariZen into MOSS gaps and drops dual hypotheses that caused high FA.
+Defaults: MOSS chunks ≤ **20 minutes**, `max_new_tokens=65536`, fuse mode **`c`**.
 
-Eval prints a JSON summary: `der`, `false_alarm`, `missed_detection`, `confusion`, `collar`. Check `mode_a.json` → `meta.n_incomplete_moss_chunks` if miss is still high.
+### Mode C behavior
+
+- **Normal:** remapped MOSS only (`meta.fusion_path=moss_primary`) — closest to single MOSS.
+- **Incomplete MOSS chunk:** DiariZen fills silence gaps only (`moss_primary_gapfill`).
+- **Speaker explosion:** if MOSS local IDs `> max(12, 2 * n_diarizen)`, use DiariZen backbone + attach MOSS text (`diarizen_backbone_explosion`). Check `mode_c.json` → `meta.explosion`.
+
+Ablations: `--mode a`, `--mode b`, or `--mode both` (writes A+B+C).
+
+Eval prints a JSON summary: `der`, `false_alarm`, `missed_detection`, `confusion`, `collar`. Check `mode_c.json` → `meta.n_incomplete_moss_chunks` / `fusion_path` if DER is high.
 
 ## 5. Baselines (ablation)
 
@@ -68,4 +76,4 @@ Cached intermediates in `--work-dir` support DiariZen-only and MOSS-only baselin
 - **DiariZen-only:** export `diarizen.json` turns to RTTM (same schema as fused output), then `fusion-diarize eval --hyp … --ref …`
 - **MOSS-only:** use remapped MOSS turns (speaker ids aligned to DiariZen) from the pipeline cache / intermediates, write RTTM, then eval
 
-Compare those DERs against `mode_a.rttm` / `mode_b.rttm` from `--mode both`.
+Compare those DERs against `mode_c.rttm` (and optionally `mode_a.rttm` / `mode_b.rttm`).
