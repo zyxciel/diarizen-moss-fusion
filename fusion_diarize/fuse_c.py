@@ -1,9 +1,19 @@
-"""Mode C fusion: MOSS-primary with DiariZen gap-fill and explosion guard."""
+"""Mode C fusion: MOSS-primary with DiariZen gap-fill and explosion guard.
+
+System exclusivity: on any time interval, output comes from **one** system only.
+MOSS is always kept; DiariZen may only fill regions with **no** MOSS speech
+(and only inside incomplete/failed chunk spans). True multi-speaker overlap
+*within* MOSS (or within DiariZen-only gaps) is preserved.
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from fusion_diarize.fuse_a import dedupe_overlapping_turns, subtract_coverage
+from fusion_diarize.fuse_a import (
+    _merge_intervals,
+    dedupe_overlapping_turns,
+    subtract_coverage,
+)
 from fusion_diarize.types import AsrStatus, Source, Turn
 
 DEFAULT_ABS_CAP = 12
@@ -61,12 +71,24 @@ def _attach_moss_text(
     return out
 
 
+def _drop_unmapped_locals(turns: list[Turn], diarizen_ids: set[str]) -> list[Turn]:
+    if not diarizen_ids:
+        return turns
+    return [
+        t
+        for t in turns
+        if not (t.speaker_id.startswith("c") and ":" in t.speaker_id)
+    ]
+
+
 def _moss_primary_turns(moss_remapped: list[Turn]) -> list[Turn]:
-    """Keep remapped MOSS only; drop bare unmapped local IDs when DiariZen IDs exist."""
+    """Keep remapped MOSS; same-ID near-duplicates from chunk overlap are deduped.
+
+    Different-speaker overlaps (true multi-talk) are intentionally kept.
+    """
     deduped = dedupe_overlapping_turns(moss_remapped)
     out: list[Turn] = []
     for t in deduped:
-        # Prefer global DiariZen-style ids; keep remapped moss with text.
         out.append(
             Turn(
                 t.start,
@@ -82,48 +104,71 @@ def _moss_primary_turns(moss_remapped: list[Turn]) -> list[Turn]:
     return out
 
 
-def _gapfill(
-    diarizen: list[Turn],
-    moss_remapped: list[Turn],
+def _incomplete_spans(moss_meta: list[dict]) -> list[tuple[float, float]]:
+    spans = [
+        (float(m["start"]), float(m["end"]))
+        for m in moss_meta
+        if m.get("incomplete") or not m.get("ok", True)
+    ]
+    return _merge_intervals(spans)
+
+
+def _intersect_with_spans(
+    turn: Turn, spans: list[tuple[float, float]]
 ) -> list[Turn]:
-    """MOSS remapped + DiariZen remnants outside MOSS coverage (same speaker)."""
-    moss_kept = _moss_primary_turns(moss_remapped)
-    # Drop unmapped namespaced locals from final mix when DiariZen IDs exist.
-    diarizen_ids = {t.speaker_id for t in diarizen}
-    if diarizen_ids:
-        moss_kept = [
-            t
-            for t in moss_kept
-            if not (t.speaker_id.startswith("c") and ":" in t.speaker_id)
-        ]
-
-    coverage: dict[str, list[tuple[float, float]]] = {}
-    for t in moss_kept:
-        coverage.setdefault(t.speaker_id, []).append((t.start, t.end))
-
-    out = list(moss_kept)
-    for t in diarizen:
-        covered = coverage.get(t.speaker_id, [])
-        if not covered:
+    """Clip ``turn`` to the union of ``spans``."""
+    out: list[Turn] = []
+    for s, e in spans:
+        a = max(turn.start, s)
+        b = min(turn.end, e)
+        if b - a > 1e-3:
             out.append(
                 Turn(
-                    t.start,
-                    t.end,
-                    t.speaker_id,
+                    a,
+                    b,
+                    turn.speaker_id,
                     "",
                     AsrStatus.EMPTY,
                     Source.DIARIZEN,
                     1.0,
                 )
             )
-        else:
-            out.extend(subtract_coverage(t, covered))
-    out.sort(key=lambda x: (x.start, x.end, x.speaker_id))
     return out
 
 
-def _has_incomplete(moss_meta: list[dict]) -> bool:
-    return any(m.get("incomplete") or not m.get("ok", True) for m in moss_meta)
+def _moss_speech_mask(moss_turns: list[Turn]) -> list[tuple[float, float]]:
+    """Union of all MOSS intervals (any speaker) — regions DiariZen must not enter."""
+    return _merge_intervals([(t.start, t.end) for t in moss_turns])
+
+
+def _gapfill(
+    diarizen: list[Turn],
+    moss_remapped: list[Turn],
+    incomplete_spans: list[tuple[float, float]],
+) -> list[Turn]:
+    """Keep all MOSS; add DiariZen only in incomplete spans with no MOSS speech.
+
+    Exclusivity: DiariZen is subtracted against the **union** of MOSS intervals
+    (all speakers), so DiariZen and MOSS never co-label the same time.
+    """
+    moss_kept = _drop_unmapped_locals(
+        _moss_primary_turns(moss_remapped),
+        {t.speaker_id for t in diarizen},
+    )
+    moss_mask = _moss_speech_mask(moss_kept)
+
+    out = list(moss_kept)
+    if not incomplete_spans:
+        out.sort(key=lambda x: (x.start, x.end, x.speaker_id))
+        return out
+
+    for t in diarizen:
+        for piece in _intersect_with_spans(t, incomplete_spans):
+            # Remove any time already claimed by MOSS (any speaker).
+            remnants = subtract_coverage(piece, moss_mask)
+            out.extend(remnants)
+    out.sort(key=lambda x: (x.start, x.end, x.speaker_id))
+    return out
 
 
 def fuse_mode_c(
@@ -155,6 +200,7 @@ def fuse_mode_c(
     }
 
     if explosion:
+        # Single-system path: DiariZen only (MOSS used for text attach).
         backbone = [
             Turn(
                 t.start,
@@ -167,20 +213,20 @@ def fuse_mode_c(
             )
             for t in diarizen
         ]
-        # Text attach needs remapped IDs aligned to DiariZen space.
         out = _attach_moss_text(backbone, moss_remapped, text_collar=text_collar)
         out.sort(key=lambda x: (x.start, x.end, x.speaker_id))
         base_meta["fusion_path"] = "diarizen_backbone_explosion"
         return out, base_meta
 
-    if _has_incomplete(moss_meta):
-        out = _gapfill(diarizen, moss_remapped)
+    incomplete = _incomplete_spans(moss_meta)
+    if incomplete:
+        out = _gapfill(diarizen, moss_remapped, incomplete)
         base_meta["fusion_path"] = "moss_primary_gapfill"
+        base_meta["incomplete_spans"] = [
+            {"start": a, "end": b} for a, b in incomplete
+        ]
         return out, base_meta
 
-    out = _moss_primary_turns(moss_remapped)
-    # Drop unmapped locals (still namespaced cXXX:) when DiariZen speakers exist.
-    if diarizen_ids:
-        out = [t for t in out if not (":" in t.speaker_id and t.speaker_id.startswith("c"))]
+    out = _drop_unmapped_locals(_moss_primary_turns(moss_remapped), diarizen_ids)
     base_meta["fusion_path"] = "moss_primary"
     return out, base_meta

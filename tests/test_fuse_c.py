@@ -50,6 +50,62 @@ def test_mode_c_incomplete_gapfill():
             assert t.start >= 99.9
 
 
+def test_mode_c_gapfill_only_inside_incomplete_span():
+    """Complete chunk must not receive DiariZen; only incomplete span gaps."""
+    diarizen = [Turn(0.0, 200.0, "speaker_0")]
+    moss_raw = [Turn(0.0, 80.0, "c000:S01", text="ok", asr_status=AsrStatus.PROVISIONAL)]
+    moss_remapped = [
+        Turn(0.0, 80.0, "speaker_0", text="ok", asr_status=AsrStatus.PROVISIONAL)
+    ]
+    # Chunk0 complete [0,100); chunk1 incomplete [100,200) with no MOSS there
+    meta = [
+        {"ok": True, "incomplete": False, "start": 0.0, "end": 100.0},
+        {"ok": True, "incomplete": True, "start": 100.0, "end": 200.0},
+    ]
+    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
+    assert info["fusion_path"] == "moss_primary_gapfill"
+    # Gap in complete chunk [80,100) must NOT be filled by DiariZen
+    for t in fused:
+        if t.source == Source.DIARIZEN:
+            assert t.start >= 99.9
+            assert t.end <= 200.0 + 1e-6
+
+
+def test_mode_c_system_exclusivity_different_speakers():
+    """DiariZen speaker_1 on same time as MOSS speaker_0 → keep MOSS only."""
+    diarizen = [
+        Turn(0.0, 10.0, "speaker_0"),
+        Turn(0.0, 10.0, "speaker_1"),  # over-split / wrong ID on same segment
+    ]
+    moss_raw = [Turn(0.0, 10.0, "c000:S01", text="hello", asr_status=AsrStatus.PROVISIONAL)]
+    moss_remapped = [
+        Turn(0.0, 10.0, "speaker_0", text="hello", asr_status=AsrStatus.PROVISIONAL)
+    ]
+    meta = [{"ok": True, "incomplete": True, "start": 0.0, "end": 10.0}]
+    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
+    assert info["fusion_path"] == "moss_primary_gapfill"
+    assert any(t.text == "hello" and t.speaker_id == "speaker_0" for t in fused)
+    assert not any(t.source == Source.DIARIZEN for t in fused)
+
+
+def test_mode_c_keeps_true_moss_multitalk():
+    """Two MOSS speakers at the same time must both remain."""
+    diarizen = [Turn(0.0, 10.0, "speaker_0")]
+    moss_raw = [
+        Turn(0.0, 5.0, "c000:S01", text="a"),
+        Turn(0.0, 5.0, "c000:S02", text="b"),
+    ]
+    moss_remapped = [
+        Turn(0.0, 5.0, "speaker_0", text="a", asr_status=AsrStatus.PROVISIONAL),
+        Turn(0.0, 5.0, "speaker_1", text="b", asr_status=AsrStatus.PROVISIONAL),
+    ]
+    meta = [{"ok": True, "incomplete": False}]
+    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
+    assert info["fusion_path"] == "moss_primary"
+    assert len(fused) == 2
+    assert {t.speaker_id for t in fused} == {"speaker_0", "speaker_1"}
+
+
 def test_mode_c_explosion_uses_diarizen_backbone():
     diarizen = [
         Turn(0.0, 5.0, "speaker_0"),

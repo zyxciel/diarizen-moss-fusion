@@ -11,11 +11,12 @@ Experiments showed chunked MOSS alone beats Mode A/B on most files once incomple
 ## Rules
 
 1. Default output = remapped MOSS boundaries + DiariZen global IDs (no bare `cXXX:Syy` in final output when mapping exists).
-2. Never OR DiariZen and MOSS activity on the same frames.
-3. DiariZen activity only when:
-   - MOSS chunk is incomplete/failed → fill silence gaps only; or
-   - MOSS invents an extreme local speaker count → DiariZen backbone + MOSS text attach.
-4. Never invent DiariZen-only speakers because `n_dz > n_moss`.
+2. **System exclusivity:** on any time region, labels come from **one** system only. MOSS always wins where it has speech; DiariZen must not co-label that time (even with a different speaker id).
+3. True multi-speaker overlap **within MOSS** is kept.
+4. DiariZen activity only when:
+   - MOSS chunk is incomplete/failed → fill silence **inside those chunk spans only**, and only where MOSS has no speech; or
+   - MOSS invents an extreme local speaker count → DiariZen becomes the **backbone timeline** (single-system path).
+5. Never invent DiariZen-only speakers because `n_dz > n_moss`.
 
 ## Gates
 
