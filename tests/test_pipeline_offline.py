@@ -295,7 +295,9 @@ def test_failed_manifest_atomic_replace_preserves_previous_manifest(
 
     assert manifest_path.read_bytes() == previous
     assert not [
-        path for path in work_dir.iterdir() if path.name.endswith(".tmp")
+        path
+        for path in work_dir.iterdir()
+        if path.name.startswith(".") and ".tmp" in path.name
     ]
 
 
@@ -324,7 +326,26 @@ def test_atomic_cache_publication_failure_leaves_no_partial_file(
 
     assert not cache_path.exists()
     assert not [
-        path for path in work_dir.iterdir() if path.name.endswith(".tmp")
+        path
+        for path in work_dir.iterdir()
+        if path.name.startswith(".") and ".tmp" in path.name
+    ]
+
+
+def test_atomic_publish_prepared_wav_accepts_tmp_wav_suffix(tmp_path: Path):
+    """torchaudio.save rejects bare .tmp; temp must end with .wav."""
+    destination = tmp_path / "prepared.wav"
+    wav = np.zeros(1600, dtype=np.float32)
+    pipeline_module._atomic_publish_file(
+        destination,
+        lambda temporary: write_mono16k_wav(temporary, wav),
+    )
+    assert destination.is_file()
+    assert destination.suffix == ".wav"
+    assert not [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(".") and ".tmp" in path.name
     ]
 
 

@@ -63,14 +63,15 @@ if MOSS_MODEL_NAME is None:
     raise FileNotFoundError("未找到 MOSS 模型目录，请检查配置")
 
 # 融合运行配置
-MODE = "c"   # "a" | "b" | "both" —— run_pipeline 的 mode 参数
-TAU = 0.6       # Mode A 的 confidence 阈值
+MODE = "c"  # "a" | "b" | "c" | "both" —— run_pipeline 的 mode 参数
+IDENTITY_MAP = "hierarchical"  # Mode C: "hierarchical" | "legacy"
+TAU = 0.6  # Mode A 的 confidence 阈值
 
 print(f"使用输入目录: {INPUT_DIR}")
 print(f"使用输出目录: {OUTPUT_DIR}")
 print(f"使用 DiariZen 模型路径: {MODEL_NAME}")
 print(f"使用 MOSS 模型路径: {MOSS_MODEL_NAME}")
-print(f"融合模式: {MODE}, tau: {TAU}")
+print(f"融合模式: {MODE}, identity_map: {IDENTITY_MAP}, tau: {TAU}")
 
 
 # ==========================================
@@ -131,8 +132,10 @@ def worker_process(gpu_id, task_queue, result_queue, processed_count):
                 # 1. 跳过已完成 —— mode_*.json + sibling TSV 同时存在视为完成
                 if MODE in ("a", "both"):
                     done_marker = work_dir / "mode_a.json"
-                else:
+                elif MODE == "b":
                     done_marker = work_dir / "mode_b.json"
+                else:  # "c"
+                    done_marker = work_dir / "mode_c.json"
                 if done_marker.is_file() and tsv_path.is_file() and tsv_path.stat().st_size > 0:
                     print(f"\n[GPU {gpu_id}] 跳过已完成的文件: {full_path}")
                     continue
@@ -148,8 +151,8 @@ def worker_process(gpu_id, task_queue, result_queue, processed_count):
                     continue
 
                 # 3. 调用融合 pipeline —— work_dir 内部缓存 prepared.wav /
-                #    diarizen.json / chunks.json / moss/ / mode_a.{rttm,json} /
-                #    mode_b.{rttm,json}；部分状态可断点续跑。
+                #    diarizen.json / chunks.json / moss/ / identity_stitching.json /
+                #    mode_*.{rttm,json}；部分状态可断点续跑。
                 outs = run_pipeline(
                     audio=Path(full_path),
                     work_dir=work_dir,
@@ -157,10 +160,13 @@ def worker_process(gpu_id, task_queue, result_queue, processed_count):
                     diarizen_runner=diarizen_runner,
                     moss_runner=moss_runner,
                     tau=TAU,
+                    identity_map=IDENTITY_MAP,
                 )
 
-                # 4. 从 Mode A（或 Mode B，若 mode=='b'）turns 重建 sibling TSV
-                if "mode_a.json" in outs:
+                # 4. Prefer Mode C turns for sibling TSV; fall back to A/B.
+                if "mode_c.json" in outs:
+                    tsv_source = work_dir / "mode_c.json"
+                elif "mode_a.json" in outs:
                     tsv_source = work_dir / "mode_a.json"
                 elif "mode_b.json" in outs:
                     tsv_source = work_dir / "mode_b.json"
@@ -288,7 +294,11 @@ def main():
         pbar.update(final_count - last_count)
 
     pbar.close()
-    print("\n✅ 全部处理完成！work_dir 输出至:", OUTPUT_DIR, "(含 mode_a/b .rttm + .json + sibling .tsv)")
+    print(
+        "\n✅ 全部处理完成！work_dir 输出至:",
+        OUTPUT_DIR,
+        f"(mode={MODE}, identity_map={IDENTITY_MAP}; mode_*.rttm/json + sibling .tsv)",
+    )
 
 
 if __name__ == "__main__":

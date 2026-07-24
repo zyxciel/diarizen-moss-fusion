@@ -83,10 +83,17 @@ def _atomic_write_diar_result(result: DiarResult, path: Path) -> None:
 
 
 def _atomic_publish_file(path: Path, writer: Callable[[Path], None]) -> None:
+    """Atomically publish ``path`` via a same-directory temp file.
+
+    The temp suffix keeps the destination extension (e.g. ``.tmp.wav``) so
+    format-sensitive writers like ``torchaudio.save`` still recognize the
+    container. A bare ``.tmp`` suffix raises ``Unsupported format: tmp``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = f".tmp{path.suffix}" if path.suffix else ".tmp"
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
-        suffix=".tmp",
+        suffix=suffix,
         dir=path.parent,
     )
     os.close(descriptor)
