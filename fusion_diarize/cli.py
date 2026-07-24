@@ -29,6 +29,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         hard_cap=args.chunk_max,
         overlap=args.chunk_overlap,
         force_rechunk=args.force_rechunk,
+        identity_map=args.identity_map,
     )
     for name, path in sorted(outs.items()):
         print(f"{name}: {path}")
@@ -45,7 +46,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     from fusion_diarize.chunk_planner import (
         DEFAULT_OVERLAP,
         DEFAULT_TARGET_MAX,
@@ -64,6 +65,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=["a", "b", "c", "both"],
         default="c",
         help="Fuse mode (default: c — MOSS-primary with DiariZen guardrails)",
+    )
+    run.add_argument(
+        "--identity-map",
+        choices=["hierarchical", "legacy"],
+        default="hierarchical",
+        help="Mode C identity strategy (default: hierarchical)",
     )
     run.add_argument("--moss-model", required=True, help="MOSS model path")
     run.add_argument(
@@ -108,8 +115,11 @@ def main(argv: list[str] | None = None) -> None:
     ev.add_argument("--ref", required=True, help="Reference RTTM")
     ev.add_argument("--collar", type=float, default=0.25, help="Collar seconds")
     ev.set_defaults(func=_cmd_eval)
+    return p
 
-    args = p.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     raise SystemExit(args.func(args))
 
 

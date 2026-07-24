@@ -105,25 +105,32 @@ class DiariZenRunner:
     def embed_moss_labels(
         self, audio_path: Path, moss_turns: list[Turn]
     ) -> dict[str, np.ndarray]:
-        """Mean-pool WeSpeaker embeddings over all crops for each local label.
+        """Duration-weight WeSpeaker embeddings over crops for each local label.
 
-        Skips zero-norm vectors (produced when a crop is too short) so that the
-        mean is taken only over valid embeddings.  Returns an empty dict when
-        ``moss_turns`` is empty, avoiding an unnecessary audio load.
+        Skips zero or nonfinite vectors so that pooling only includes valid
+        embeddings. Returns an empty dict when ``moss_turns`` is empty,
+        avoiding an unnecessary audio load.
         """
         if not moss_turns:
             return {}
         wav, sr = load_mono16k(audio_path)
         assert sr == 16000
         by_label: dict[str, list[np.ndarray]] = {}
+        durations: dict[str, list[float]] = {}
         for t in moss_turns:
             emb = self._embed_region(wav, t.start, t.end)
-            # Skip zero vectors (too-short crop fallback) so they don't drag
-            # the mean toward the origin.
-            if np.any(emb != 0):
+            # Skip invalid vectors so they do not affect the pooled embedding.
+            if np.all(np.isfinite(emb)) and np.any(emb != 0):
                 by_label.setdefault(t.speaker_id, []).append(emb)
+                i0 = max(0, int(round(t.start * sr)))
+                i1 = min(len(wav), int(round(t.end * sr)))
+                durations.setdefault(t.speaker_id, []).append(
+                    max((i1 - i0) / sr, 1e-3)
+                )
         return {
-            k: np.mean(np.stack(v, axis=0), axis=0).astype(np.float32)
+            k: np.average(
+                np.stack(v, axis=0), axis=0, weights=durations[k]
+            ).astype(np.float32)
             for k, v in by_label.items()
         }
 
