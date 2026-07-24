@@ -20,3 +20,168 @@ def test_diarizen_runner_module_imports_without_constructing():
     assert hasattr(mod, "DiariZenRunner")
     assert hasattr(mod, "align_centroids")
     assert mod.DIARIZEN_REPO == "BUT-FIT/diarizen-wavlm-large-s80-md"
+
+
+def test_embed_moss_labels_weights_embeddings_by_turn_duration(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    embeddings = iter(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(64000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(runner, "_embed_region", lambda *_: next(embeddings))
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [Turn(0.0, 1.0, "speaker_0"), Turn(1.0, 4.0, "speaker_0")],
+    )
+
+    np.testing.assert_allclose(
+        pooled["speaker_0"], np.array([0.25, 0.75], dtype=np.float32)
+    )
+    assert pooled["speaker_0"].dtype == np.float32
+
+
+def test_embed_moss_labels_keeps_weights_aligned_when_skipping_invalid(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    embeddings = iter(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.zeros(2, dtype=np.float32),
+            np.array([np.nan, 1.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(160000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(runner, "_embed_region", lambda *_: next(embeddings))
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [
+            Turn(0.0, 1.0, "speaker_0"),
+            Turn(1.0, 3.0, "speaker_0"),
+            Turn(3.0, 7.0, "speaker_0"),
+            Turn(7.0, 10.0, "speaker_0"),
+        ],
+    )
+
+    np.testing.assert_allclose(
+        pooled["speaker_0"], np.array([0.25, 0.75], dtype=np.float32)
+    )
+
+
+def test_embed_moss_labels_keeps_namespaced_labels_independent(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    embeddings = iter(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(32000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(runner, "_embed_region", lambda *_: next(embeddings))
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [Turn(0.0, 1.0, "c000:S01"), Turn(1.0, 2.0, "c001:S01")],
+    )
+
+    assert set(pooled) == {"c000:S01", "c001:S01"}
+    np.testing.assert_array_equal(
+        pooled["c000:S01"], np.array([1.0, 0.0], dtype=np.float32)
+    )
+    np.testing.assert_array_equal(
+        pooled["c001:S01"], np.array([0.0, 1.0], dtype=np.float32)
+    )
+
+
+def test_embed_moss_labels_weights_boundary_overrun_by_clipped_duration(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    embeddings = iter(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(16000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(runner, "_embed_region", lambda *_: next(embeddings))
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [Turn(0.75, 2.0, "speaker_0"), Turn(0.0, 0.75, "speaker_0")],
+    )
+
+    np.testing.assert_allclose(
+        pooled["speaker_0"], np.array([0.25, 0.75], dtype=np.float32)
+    )
+
+
+def test_embed_moss_labels_floors_tiny_clipped_duration_weight(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    embeddings = iter(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(16000, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(runner, "_embed_region", lambda *_: next(embeddings))
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [Turn(0.9995, 2.0, "speaker_0"), Turn(0.0, 0.003, "speaker_0")],
+    )
+
+    np.testing.assert_allclose(
+        pooled["speaker_0"], np.array([0.25, 0.75], dtype=np.float32)
+    )
+
+
+def test_embed_moss_labels_empty_input_does_not_load_audio(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+
+    runner = object.__new__(mod.DiariZenRunner)
+
+    def fail_if_called(_):
+        raise AssertionError("load_mono16k must not be called")
+
+    monkeypatch.setattr(mod, "load_mono16k", fail_if_called)
+
+    assert runner.embed_moss_labels("audio.wav", []) == {}

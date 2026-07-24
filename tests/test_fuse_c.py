@@ -1,168 +1,220 @@
-from fusion_diarize.fuse_c import (
-    detect_speaker_explosion,
-    fuse_mode_c,
-)
+from fusion_diarize.fuse_c import fuse_mode_c
 from fusion_diarize.types import AsrStatus, Source, Turn
 
 
-def test_detect_speaker_explosion_threshold():
-    assert detect_speaker_explosion({f"c000:S{i:02d}" for i in range(30)}, {f"speaker_{i}" for i in range(5)})
-    assert not detect_speaker_explosion(
-        {f"c000:S{i:02d}" for i in range(5)}, {f"speaker_{i}" for i in range(5)}
-    )
-    # abs_cap=12 dominates when n_dz is small
-    assert detect_speaker_explosion({f"l{i}" for i in range(13)}, {"speaker_0"})
-    assert not detect_speaker_explosion({f"l{i}" for i in range(12)}, {"speaker_0"})
+def _assert_no_cross_system_overlap(turns: list[Turn]) -> None:
+    moss = [t for t in turns if t.source in (Source.MOSS, Source.FUSED)]
+    diarizen = [t for t in turns if t.source == Source.DIARIZEN]
+    for mt in moss:
+        for dt in diarizen:
+            assert min(mt.end, dt.end) <= max(mt.start, dt.start)
 
 
-def test_mode_c_normal_moss_primary_no_diarizen_intervals():
+def test_mode_c_normal_returns_stitched_moss_unchanged_without_dedupe():
     diarizen = [Turn(0.0, 10.0, "speaker_0")]
-    moss_raw = [Turn(0.1, 4.9, "c000:S01", text="hello", asr_status=AsrStatus.PROVISIONAL)]
-    moss_remapped = [
-        Turn(0.1, 4.9, "speaker_0", text="hello", asr_status=AsrStatus.PROVISIONAL, source=Source.MOSS)
+    moss_stitched = [
+        Turn(0.0, 5.0, "global:alice", text="hello", source=Source.MOSS),
+        Turn(0.1, 5.1, "global:alice", text="again", source=Source.MOSS),
     ]
     meta = [{"ok": True, "incomplete": False, "start": 0.0, "end": 10.0}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
+
+    fused, info = fuse_mode_c(diarizen, moss_stitched, meta)
+
     assert info["fusion_path"] == "moss_primary"
-    assert info["explosion"] is False
-    assert all(t.source != Source.DIARIZEN for t in fused)
-    assert len(fused) == 1
-    assert fused[0].text == "hello"
-    assert abs(fused[0].start - 0.1) < 1e-6
-
-
-def test_mode_c_incomplete_gapfill():
-    diarizen = [Turn(0.0, 200.0, "speaker_0")]
-    moss_raw = [Turn(0.0, 100.0, "c000:S01", text="partial", asr_status=AsrStatus.PROVISIONAL)]
-    moss_remapped = [
-        Turn(0.0, 100.0, "speaker_0", text="partial", asr_status=AsrStatus.PROVISIONAL)
+    assert [(t.start, t.end, t.speaker_id, t.text) for t in fused] == [
+        (0.0, 5.0, "global:alice", "hello"),
+        (0.1, 5.1, "global:alice", "again"),
     ]
-    meta = [{"ok": True, "incomplete": True, "start": 0.0, "end": 200.0}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["fusion_path"] == "moss_primary_gapfill"
-    assert any(t.source in (Source.FUSED, Source.MOSS) and t.end <= 100.1 for t in fused)
-    assert any(
-        t.source == Source.DIARIZEN and t.start >= 99.9 and t.end >= 199.0 for t in fused
-    )
-    # No DiariZen under MOSS span
-    for t in fused:
-        if t.source == Source.DIARIZEN:
-            assert t.start >= 99.9
+    assert all(t.source == Source.FUSED for t in fused)
+    assert all(t is not original for t, original in zip(fused, moss_stitched))
 
 
-def test_mode_c_gapfill_only_inside_incomplete_span():
-    """Complete chunk must not receive DiariZen; only incomplete span gaps."""
-    diarizen = [Turn(0.0, 200.0, "speaker_0")]
-    moss_raw = [Turn(0.0, 80.0, "c000:S01", text="ok", asr_status=AsrStatus.PROVISIONAL)]
-    moss_remapped = [
-        Turn(0.0, 80.0, "speaker_0", text="ok", asr_status=AsrStatus.PROVISIONAL)
-    ]
-    # Chunk0 complete [0,100); chunk1 incomplete [100,200) with no MOSS there
-    meta = [
-        {"ok": True, "incomplete": False, "start": 0.0, "end": 100.0},
-        {"ok": True, "incomplete": True, "start": 100.0, "end": 200.0},
-    ]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["fusion_path"] == "moss_primary_gapfill"
-    # Gap in complete chunk [80,100) must NOT be filled by DiariZen
-    for t in fused:
-        if t.source == Source.DIARIZEN:
-            assert t.start >= 99.9
-            assert t.end <= 200.0 + 1e-6
-
-
-def test_mode_c_system_exclusivity_different_speakers():
-    """DiariZen speaker_1 on same time as MOSS speaker_0 → keep MOSS only."""
+def test_mode_c_all_failed_without_moss_uses_full_diarizen_copy():
     diarizen = [
-        Turn(0.0, 10.0, "speaker_0"),
-        Turn(0.0, 10.0, "speaker_1"),  # over-split / wrong ID on same segment
-    ]
-    moss_raw = [Turn(0.0, 10.0, "c000:S01", text="hello", asr_status=AsrStatus.PROVISIONAL)]
-    moss_remapped = [
-        Turn(0.0, 10.0, "speaker_0", text="hello", asr_status=AsrStatus.PROVISIONAL)
-    ]
-    meta = [{"ok": True, "incomplete": True, "start": 0.0, "end": 10.0}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["fusion_path"] == "moss_primary_gapfill"
-    assert any(t.text == "hello" and t.speaker_id == "speaker_0" for t in fused)
-    assert not any(t.source == Source.DIARIZEN for t in fused)
-
-
-def test_mode_c_keeps_true_moss_multitalk():
-    """Two MOSS speakers at the same time must both remain."""
-    diarizen = [Turn(0.0, 10.0, "speaker_0")]
-    moss_raw = [
-        Turn(0.0, 5.0, "c000:S01", text="a"),
-        Turn(0.0, 5.0, "c000:S02", text="b"),
-    ]
-    moss_remapped = [
-        Turn(0.0, 5.0, "speaker_0", text="a", asr_status=AsrStatus.PROVISIONAL),
-        Turn(0.0, 5.0, "speaker_1", text="b", asr_status=AsrStatus.PROVISIONAL),
-    ]
-    meta = [{"ok": True, "incomplete": False}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["fusion_path"] == "moss_primary"
-    assert len(fused) == 2
-    assert {t.speaker_id for t in fused} == {"speaker_0", "speaker_1"}
-
-
-def test_mode_c_explosion_uses_diarizen_backbone():
-    diarizen = [
-        Turn(0.0, 5.0, "speaker_0"),
-        Turn(5.0, 10.0, "speaker_1"),
-        Turn(10.0, 15.0, "speaker_2"),
-        Turn(15.0, 20.0, "speaker_3"),
-        Turn(20.0, 25.0, "speaker_4"),
-    ]
-    moss_raw = [
-        Turn(float(i), float(i) + 0.5, f"c000:S{i:02d}", text=f"t{i}")
-        for i in range(30)
-    ]
-    # Remap many locals onto few globals (many-to-one)
-    moss_remapped = [
         Turn(
-            float(i),
-            float(i) + 0.5,
-            f"speaker_{i % 5}",
-            text=f"t{i}",
-            asr_status=AsrStatus.PROVISIONAL,
+            0.0,
+            10.0,
+            "speaker_0",
+            text="dz",
+            asr_status=AsrStatus.FINAL,
+            source=Source.FUSED,
+            confidence=0.7,
         )
-        for i in range(30)
     ]
-    meta = [{"ok": True, "incomplete": False, "start": 0.0, "end": 30.0}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["explosion"] is True
-    assert info["fusion_path"] == "diarizen_backbone_explosion"
-    assert info["n_moss_local"] == 30
-    assert len([t for t in fused if t.source in (Source.DIARIZEN, Source.FUSED)]) >= 5
-    # Backbone intervals match DiariZen starts
-    starts = sorted(t.start for t in fused)
-    assert starts[0] == 0.0
-
-
-def test_mode_c_explosion_attaches_moss_text():
-    diarizen = [Turn(0.0, 5.0, "speaker_0")]
-    moss_raw = [Turn(0.0, 5.0, f"c000:S{i:02d}") for i in range(20)]
-    moss_remapped = [
-        Turn(0.05, 4.9, "speaker_0", text="hello", asr_status=AsrStatus.PROVISIONAL)
+    meta = [
+        {"ok": False, "start": 0.0, "end": 5.0},
+        {"ok": False, "start": 5.0, "end": 10.0},
     ]
-    meta = [{"ok": True, "incomplete": False}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["explosion"] is True
-    assert any(t.text == "hello" for t in fused)
 
+    fused, info = fuse_mode_c(diarizen, [], meta)
 
-def test_mode_c_dedupes_overlap():
-    diarizen = [Turn(0.0, 10.0, "speaker_0")]
-    moss_raw = [
-        Turn(0.0, 5.0, "c000:S01", text="a"),
-        Turn(0.1, 5.1, "c000:S01", text="a2"),
-    ]
-    moss_remapped = [
-        Turn(0.0, 5.0, "speaker_0", text="a", asr_status=AsrStatus.PROVISIONAL),
-        Turn(0.1, 5.1, "speaker_0", text="a2", asr_status=AsrStatus.PROVISIONAL),
-    ]
-    meta = [{"ok": True, "incomplete": False}]
-    fused, info = fuse_mode_c(diarizen, moss_raw, moss_remapped, meta)
-    assert info["fusion_path"] == "moss_primary"
+    assert info["fusion_path"] == "diarizen_backbone_all_moss_failed"
     assert len(fused) == 1
+    assert fused[0] is not diarizen[0]
+    assert fused[0].source == Source.DIARIZEN
+    assert (fused[0].text, fused[0].asr_status, fused[0].confidence) == (
+        "dz",
+        AsrStatus.FINAL,
+        0.7,
+    )
+
+
+def test_mode_c_all_failed_omits_nonpositive_and_tiny_diarizen_turns():
+    diarizen = [
+        Turn(0.0, 0.0, "zero"),
+        Turn(2.0, 1.0, "negative"),
+        Turn(3.0, 3.001, "threshold"),
+        Turn(4.0, 4.002, "valid"),
+    ]
+    meta = [{"ok": False, "start": 0.0, "end": 5.0}]
+
+    fused, info = fuse_mode_c(diarizen, [], meta)
+
+    assert info["fusion_path"] == "diarizen_backbone_all_moss_failed"
+    assert [(t.start, t.end, t.speaker_id) for t in fused] == [
+        (4.0, 4.002, "valid")
+    ]
+
+
+def test_mode_c_span_local_explosion_replaces_only_exploded_interval():
+    diarizen = [Turn(0.0, 10.0, "dz")]
+    moss_stitched = [
+        Turn(0.0, 5.0, "moss_a", text="before", source=Source.MOSS),
+        Turn(5.0, 10.0, "moss_b", text="exploded", source=Source.MOSS),
+    ]
+    meta = [{"ok": True, "start": 0.0, "end": 10.0}]
+
+    fused, info = fuse_mode_c(
+        diarizen, moss_stitched, meta, exploded_spans=[(5.0, 10.0)]
+    )
+
+    assert info == {
+        "fusion_path": "moss_primary_with_explosion_fallback",
+        "exploded_spans": [{"start": 5.0, "end": 10.0}],
+    }
+    assert [(t.start, t.end, t.speaker_id, t.source) for t in fused] == [
+        (0.0, 5.0, "moss_a", Source.FUSED),
+        (5.0, 10.0, "dz", Source.DIARIZEN),
+    ]
+    _assert_no_cross_system_overlap(fused)
+
+
+def test_mode_c_split_moss_text_is_assigned_to_one_longest_fragment():
+    diarizen = [Turn(0.0, 10.0, "dz")]
+    moss_stitched = [
+        Turn(
+            0.0,
+            10.0,
+            "moss",
+            text="say this once",
+            asr_status=AsrStatus.FINAL,
+            source=Source.MOSS,
+        )
+    ]
+    meta = [{"ok": True, "start": 0.0, "end": 10.0}]
+
+    fused, _ = fuse_mode_c(
+        diarizen, moss_stitched, meta, exploded_spans=[(4.0, 6.0)]
+    )
+
+    moss_fragments = [t for t in fused if t.speaker_id == "moss"]
+    assert [
+        (t.start, t.end, t.text, t.asr_status, t.source) for t in moss_fragments
+    ] == [
+        (0.0, 4.0, "say this once", AsrStatus.FINAL, Source.FUSED),
+        (6.0, 10.0, "", AsrStatus.EMPTY, Source.MOSS),
+    ]
+
+
+def test_mode_c_clipped_diarizen_fallback_drops_text_and_status():
+    diarizen = [
+        Turn(
+            0.0,
+            5.0,
+            "dz",
+            text="must not duplicate",
+            asr_status=AsrStatus.FINAL,
+        )
+    ]
+    meta = [{"ok": True, "start": 0.0, "end": 5.0}]
+
+    fused, _ = fuse_mode_c(
+        diarizen,
+        [],
+        meta,
+        exploded_spans=[(3.0, 4.0), (1.0, 2.0)],
+    )
+
+    assert [(t.start, t.end, t.text, t.asr_status) for t in fused] == [
+        (1.0, 2.0, "", AsrStatus.EMPTY),
+        (3.0, 4.0, "", AsrStatus.EMPTY),
+    ]
+
+
+def test_mode_c_explosion_precedes_incomplete_and_gapfills_remainder():
+    diarizen = [Turn(0.0, 12.0, "dz")]
+    moss_stitched = [
+        Turn(0.0, 5.0, "moss_a", text="a", source=Source.MOSS),
+        Turn(6.0, 10.0, "moss_b", text="b", source=Source.MOSS),
+    ]
+    meta = [{"ok": True, "incomplete": True, "start": 4.0, "end": 12.0}]
+
+    fused, info = fuse_mode_c(
+        diarizen, moss_stitched, meta, exploded_spans=[(4.0, 6.0)]
+    )
+
+    assert info["fusion_path"] == "moss_primary_with_explosion_fallback"
+    assert info["exploded_spans"] == [{"start": 4.0, "end": 6.0}]
+    assert info["incomplete_spans"] == [{"start": 4.0, "end": 12.0}]
+    assert [(t.start, t.end, t.source) for t in fused] == [
+        (0.0, 4.0, Source.FUSED),
+        (4.0, 6.0, Source.DIARIZEN),
+        (6.0, 10.0, Source.FUSED),
+        (10.0, 12.0, Source.DIARIZEN),
+    ]
+    _assert_no_cross_system_overlap(fused)
+
+
+def test_mode_c_incomplete_gapfill_is_system_exclusive():
+    diarizen = [
+        Turn(0.0, 10.0, "dz_a"),
+        Turn(0.0, 10.0, "dz_b"),
+    ]
+    moss_stitched = [
+        Turn(2.0, 7.0, "moss", text="speech", source=Source.MOSS)
+    ]
+    meta = [{"ok": False, "start": 0.0, "end": 10.0}]
+
+    fused, info = fuse_mode_c(diarizen, moss_stitched, meta)
+
+    assert info["fusion_path"] == "moss_primary_gapfill"
+    assert info["incomplete_spans"] == [{"start": 0.0, "end": 10.0}]
+    assert [(t.start, t.end, t.speaker_id, t.source) for t in fused] == [
+        (0.0, 2.0, "dz_a", Source.DIARIZEN),
+        (0.0, 2.0, "dz_b", Source.DIARIZEN),
+        (2.0, 7.0, "moss", Source.FUSED),
+        (7.0, 10.0, "dz_a", Source.DIARIZEN),
+        (7.0, 10.0, "dz_b", Source.DIARIZEN),
+    ]
+    _assert_no_cross_system_overlap(fused)
+
+
+def test_mode_c_retains_true_moss_multitalk_during_gapfill():
+    diarizen = [Turn(0.0, 8.0, "dz")]
+    moss_stitched = [
+        Turn(2.0, 6.0, "alice", text="a", source=Source.MOSS),
+        Turn(3.0, 5.0, "bob", text="b", source=Source.MOSS),
+    ]
+    meta = [{"ok": True, "incomplete": True, "start": 0.0, "end": 8.0}]
+
+    fused, info = fuse_mode_c(diarizen, moss_stitched, meta)
+
+    assert info["fusion_path"] == "moss_primary_gapfill"
+    assert {(t.start, t.end, t.speaker_id) for t in fused if t.source == Source.FUSED} == {
+        (2.0, 6.0, "alice"),
+        (3.0, 5.0, "bob"),
+    }
+    assert [(t.start, t.end) for t in fused if t.source == Source.DIARIZEN] == [
+        (0.0, 2.0),
+        (6.0, 8.0),
+    ]
