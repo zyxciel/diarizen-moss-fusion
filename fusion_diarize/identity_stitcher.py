@@ -15,16 +15,23 @@ from fusion_diarize.types import ChunkWindow, Turn
 @dataclass(frozen=True)
 class StitchConfig:
     frame_hop: float = 0.02
-    min_overlap_activity: float = 2.0
-    min_intersection: float = 1.0
+    min_overlap_activity: float = 3.0
+    min_intersection: float = 1.5
+    min_intersection_ratio: float = 0.3
+    overlap_mask_dilation: float = 0.2
     overlap_link_score: float = 0.70
     assignment_margin: float = 0.10
     embedding_cosine: float = 0.80
     embedding_margin: float = 0.05
+    matching_anchor_cosine: float = 0.75
     conflicting_anchor_cosine: float = 0.85
-    cluster_max_distance: float = 0.30
+    asymmetric_anchor_cosine: float = 0.95
+    long_distance_chunk_span: int = 2
+    cluster_max_distance: float = 0.25
+    centroid_outlier_distance: float = 0.15
     anchor_purity: float = 0.70
     anchor_min_overlap: float = 3.0
+    anchor_activity_ratio: float = 0.6
     anchor_min_cosine: float = 0.40
     explosion_abs_cap: int = 12
     explosion_ratio: float = 2.0
@@ -42,19 +49,30 @@ class StitchConfig:
         for name in (
             "min_overlap_activity",
             "min_intersection",
+            "min_intersection_ratio",
+            "overlap_mask_dilation",
             "assignment_margin",
             "embedding_margin",
             "cluster_max_distance",
+            "centroid_outlier_distance",
             "anchor_min_overlap",
+            "anchor_activity_ratio",
         ):
             if values[name] < 0:
                 raise ValueError(f"{name} must be nonnegative")
-        for name in ("overlap_link_score", "anchor_purity"):
+        for name in (
+            "overlap_link_score",
+            "anchor_purity",
+            "min_intersection_ratio",
+            "anchor_activity_ratio",
+        ):
             if not 0 <= values[name] <= 1:
                 raise ValueError(f"{name} must be between 0 and 1")
         for name in (
             "embedding_cosine",
+            "matching_anchor_cosine",
             "conflicting_anchor_cosine",
+            "asymmetric_anchor_cosine",
             "anchor_min_cosine",
         ):
             if not -1 <= values[name] <= 1:
@@ -65,18 +83,22 @@ class StitchConfig:
             raise ValueError("embedding_margin must not exceed 2")
         if self.cluster_max_distance > 2:
             raise ValueError("cluster_max_distance must not exceed 2")
-        if (
-            isinstance(self.explosion_abs_cap, bool)
-            or not isinstance(self.explosion_abs_cap, Integral)
-            or self.explosion_abs_cap < 0
-        ):
-            raise ValueError("explosion_abs_cap must be a nonnegative integer")
+        if self.centroid_outlier_distance > 2:
+            raise ValueError("centroid_outlier_distance must not exceed 2")
+        for name in ("explosion_abs_cap", "long_distance_chunk_span"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a nonnegative integer")
         if self.explosion_ratio <= 0:
             raise ValueError("explosion_ratio must be positive")
         for name in values:
             normalized = (
                 int(getattr(self, name))
-                if name == "explosion_abs_cap"
+                if name in ("explosion_abs_cap", "long_distance_chunk_span")
                 else float(getattr(self, name))
             )
             object.__setattr__(self, name, normalized)
@@ -90,6 +112,10 @@ class LocalSpeakerNode:
     embedding: np.ndarray | None
     anchor: str | None = None
     anchor_purity: float = 0.0
+
+    @property
+    def total_activity_duration(self) -> float:
+        return float(sum(max(0.0, item.end - item.start) for item in self.turns))
 
 
 @dataclass(frozen=True)
@@ -137,17 +163,36 @@ def _paint(
     return mask
 
 
+def _dilate_mask(mask: np.ndarray, radius_frames: int) -> np.ndarray:
+    """Expand True runs by ``radius_frames`` on each side (edge jitter tolerance)."""
+    if radius_frames <= 0 or mask.size == 0 or not np.any(mask):
+        return mask
+    padded = np.pad(mask, radius_frames, mode="constant", constant_values=False)
+    window = 2 * radius_frames + 1
+    # Any-True in a sliding window == binary dilation with a flat kernel.
+    cumulative = np.cumsum(padded.astype(np.int32))
+    totals = cumulative[window - 1 :] - np.concatenate(
+        ([0], cumulative[: len(padded) - window])
+    )
+    return totals > 0
+
+
 def activity_iou(
     left_turns: list[Turn],
     right_turns: list[Turn],
     window_start: float,
     window_end: float,
     frame_hop: float = 0.02,
+    dilation_seconds: float = 0.0,
 ) -> tuple[float, float, float, float]:
     if window_end <= window_start:
         return (0.0, 0.0, 0.0, 0.0)
     left = _paint(left_turns, window_start, window_end, frame_hop)
     right = _paint(right_turns, window_start, window_end, frame_hop)
+    if dilation_seconds > 0:
+        radius = max(0, int(round(dilation_seconds / frame_hop)))
+        left = _dilate_mask(left, radius)
+        right = _dilate_mask(right, radius)
     union = int(np.count_nonzero(left | right))
     if union == 0:
         return (0.0, 0.0, 0.0, 0.0)
@@ -235,7 +280,14 @@ def compute_diarizen_anchors(
             overlaps, key=lambda item: (item[0], item[1])
         )
         purity = intersection / total_overlap
-        if intersection + 1e-9 < config.anchor_min_overlap:
+        activity_duration = max(
+            active * config.frame_hop, node.total_activity_duration
+        )
+        dynamic_min_overlap = min(
+            config.anchor_min_overlap,
+            activity_duration * config.anchor_activity_ratio,
+        )
+        if intersection + 1e-9 < dynamic_min_overlap:
             continue
         if purity + 1e-9 < config.anchor_purity:
             continue
@@ -272,13 +324,23 @@ def match_adjacent_chunks(
         )
         if start >= end or not left_nodes or not right_nodes:
             continue
+        overlap_window_duration = end - start
+        dynamic_min_intersection = max(
+            config.min_intersection,
+            config.min_intersection_ratio * overlap_window_duration,
+        )
         scores = np.full((len(left_nodes), len(right_nodes)), -1e6, dtype=float)
         details: dict[tuple[int, int], tuple[float, float | None]] = {}
         assignable: set[tuple[int, int]] = set()
         for row, left in enumerate(left_nodes):
             for column, right in enumerate(right_nodes):
                 iou, intersection, left_active, right_active = activity_iou(
-                    left.turns, right.turns, start, end, config.frame_hop
+                    left.turns,
+                    right.turns,
+                    start,
+                    end,
+                    config.frame_hop,
+                    dilation_seconds=config.overlap_mask_dilation,
                 )
                 diagnostic = {
                     "left": left.local_id,
@@ -288,11 +350,12 @@ def match_adjacent_chunks(
                     "intersection_seconds": intersection,
                     "left_seconds": left_active,
                     "right_seconds": right_active,
+                    "dynamic_min_intersection": dynamic_min_intersection,
                 }
                 if (
                     left_active + 1e-9 < config.min_overlap_activity
                     or right_active + 1e-9 < config.min_overlap_activity
-                    or intersection + 1e-9 < config.min_intersection
+                    or intersection + 1e-9 < dynamic_min_intersection
                 ):
                     diagnostic["reason"] = "insufficient_overlap_activity"
                     rejected.append(diagnostic)
@@ -388,11 +451,21 @@ def match_adjacent_chunks(
     return accepted, rejected
 
 
+def _embedding_cosine_threshold(
+    left: LocalSpeakerNode, right: LocalSpeakerNode, config: StitchConfig
+) -> float:
+    if left.anchor is not None and right.anchor is not None:
+        if left.anchor == right.anchor:
+            return config.matching_anchor_cosine
+        return config.conflicting_anchor_cosine
+    return config.embedding_cosine
+
+
 def build_embedding_edges(
     nodes: list[LocalSpeakerNode],
     config: StitchConfig = StitchConfig(),
 ) -> tuple[list[LinkEdge], list[dict[str, Any]]]:
-    similarities: dict[tuple[int, int], float] = {}
+    eligible: dict[tuple[int, int], float] = {}
     rejected: list[dict[str, Any]] = []
     for left_index, left in enumerate(nodes):
         for right_index in range(left_index + 1, len(nodes)):
@@ -400,56 +473,60 @@ def build_embedding_edges(
             if left.chunk_index == right.chunk_index:
                 continue
             cosine = _cosine(left.embedding, right.embedding)
+            diagnostic = {
+                "left": left.local_id,
+                "right": right.local_id,
+                "embedding_cosine": cosine,
+            }
             if abs(left.chunk_index - right.chunk_index) == 1:
-                rejected.append(
-                    {
-                        "left": left.local_id,
-                        "right": right.local_id,
-                        "embedding_cosine": cosine,
-                        "reason": "adjacent_chunks_use_overlap",
-                    }
-                )
+                diagnostic["reason"] = "adjacent_chunks_use_overlap"
+                rejected.append(diagnostic)
                 continue
-            if cosine is not None:
-                similarities[(left_index, right_index)] = cosine
+            if cosine is None:
+                diagnostic["reason"] = "missing_embedding"
+                rejected.append(diagnostic)
+                continue
+            chunk_span = abs(right.chunk_index - left.chunk_index)
+            if chunk_span > config.long_distance_chunk_span and (
+                left.anchor is None
+                or right.anchor is None
+                or left.anchor != right.anchor
+            ):
+                diagnostic["reason"] = "long_distance_without_matching_anchors"
+                rejected.append(diagnostic)
+                continue
+            if left.anchor is None and right.anchor is None:
+                diagnostic["reason"] = "both_no_anchor"
+                rejected.append(diagnostic)
+                continue
+            if (left.anchor is None) != (right.anchor is None):
+                if cosine + 1e-9 < config.asymmetric_anchor_cosine:
+                    diagnostic["reason"] = "asymmetric_anchor_low_confidence"
+                    rejected.append(diagnostic)
+                    continue
+            threshold = _embedding_cosine_threshold(left, right, config)
+            if cosine + 1e-9 < threshold:
+                diagnostic["threshold"] = threshold
+                diagnostic["reason"] = (
+                    "conflicting_anchors"
+                    if (
+                        left.anchor is not None
+                        and right.anchor is not None
+                        and left.anchor != right.anchor
+                    )
+                    else "below_dynamic_cosine_threshold"
+                )
+                rejected.append(diagnostic)
+                continue
+            eligible[(left_index, right_index)] = cosine
 
     incident_best: dict[int, list[tuple[tuple[int, int], float]]] = {}
-    for pair, cosine in similarities.items():
+    for pair, cosine in eligible.items():
         for node_index in pair:
             best = incident_best.setdefault(node_index, [])
             best.append((pair, cosine))
             best.sort(key=lambda item: (-item[1], item[0]))
             del best[2:]
-
-    eligible: dict[tuple[int, int], float] = {}
-    for (left_index, right_index), cosine in similarities.items():
-        left, right = nodes[left_index], nodes[right_index]
-        if cosine + 1e-9 < config.embedding_cosine:
-            rejected.append(
-                {
-                    "left": left.local_id,
-                    "right": right.local_id,
-                    "embedding_cosine": cosine,
-                    "reason": "below_embedding_cosine",
-                }
-            )
-            continue
-        if (
-            left.anchor is not None
-            and right.anchor is not None
-            and left.anchor != right.anchor
-            and cosine + 1e-9 < config.conflicting_anchor_cosine
-        ):
-            rejected.append(
-                {
-                    "left": left.local_id,
-                    "right": right.local_id,
-                    "embedding_cosine": cosine,
-                    "reason": "conflicting_anchors",
-                }
-            )
-            continue
-        eligible[(left_index, right_index)] = cosine
 
     incident: dict[int, list[tuple[tuple[int, int], float]]] = {}
     for pair, cosine in eligible.items():
@@ -549,6 +626,56 @@ class _Components:
         return {item for item in self.parent if self.find(item) == root}
 
 
+def _component_centroid(
+    identifiers: set[str],
+    by_id: dict[str, LocalSpeakerNode],
+) -> np.ndarray | None:
+    vectors = []
+    for identifier in sorted(identifiers):
+        vector = _embedding(by_id[identifier].embedding)
+        if vector is None:
+            continue
+        norm = float(np.linalg.norm(vector))
+        if norm == 0:
+            continue
+        vectors.append(vector / norm)
+    if not vectors:
+        return None
+    centroid = np.mean(np.stack(vectors, axis=0), axis=0)
+    norm = float(np.linalg.norm(centroid))
+    if norm == 0:
+        return None
+    return centroid / norm
+
+
+def _component_centroid_outlier(
+    identifiers: set[str],
+    by_id: dict[str, LocalSpeakerNode],
+    config: StitchConfig,
+) -> tuple[str, float] | None:
+    if len(identifiers) < 2:
+        return None
+    centroid = _component_centroid(identifiers, by_id)
+    if centroid is None:
+        return None
+    worst_id: str | None = None
+    worst_distance = -1.0
+    for identifier in sorted(identifiers):
+        cosine = _cosine(by_id[identifier].embedding, centroid)
+        if cosine is None:
+            continue
+        distance = 1.0 - cosine
+        if distance > worst_distance + 1e-12 or (
+            abs(distance - worst_distance) <= 1e-12
+            and (worst_id is None or identifier < worst_id)
+        ):
+            worst_distance = distance
+            worst_id = identifier
+    if worst_id is None or worst_distance <= config.centroid_outlier_distance + 1e-9:
+        return None
+    return worst_id, worst_distance
+
+
 def _component_violation(
     identifiers: set[str],
     by_id: dict[str, LocalSpeakerNode],
@@ -560,6 +687,13 @@ def _component_violation(
     maximum, _, pair = _component_distances(identifiers, by_id)
     if maximum > config.cluster_max_distance + 1e-9:
         return "cluster_max_distance", {"max_distance": maximum, "pair": pair}
+    outlier = _component_centroid_outlier(identifiers, by_id, config)
+    if outlier is not None:
+        outlier_id, distance = outlier
+        return "centroid_outlier", {
+            "outlier": outlier_id,
+            "centroid_distance": distance,
+        }
     return None
 
 
@@ -629,26 +763,38 @@ def cluster_nodes(
         components.union(edge.left, edge.right)
         accepted.append(edge)
 
-    # Safety validation recomputes components after removing the weakest offending edge.
+    # Safety validation: drop the weakest edge that sustains a diameter/outlier trap.
     while True:
         groups = {
             frozenset(components.members(identifier)) for identifier in sorted(by_id)
         }
-        offending = next(
-            (
-                group
-                for group in groups
-                if _component_violation(set(group), by_id, config) is not None
-            ),
-            None,
-        )
-        if offending is None:
+        offending_group = None
+        offending_violation: tuple[str, dict[str, Any]] | None = None
+        for group in groups:
+            violation = _component_violation(set(group), by_id, config)
+            if violation is not None:
+                offending_group = group
+                offending_violation = violation
+                break
+        if offending_group is None or offending_violation is None:
             break
+        reason, diagnostic = offending_violation
         candidates = [
             edge
             for edge in accepted
-            if edge.left in offending and edge.right in offending
+            if edge.left in offending_group and edge.right in offending_group
         ]
+        outlier_id = diagnostic.get("outlier")
+        if reason == "centroid_outlier" and outlier_id is not None:
+            outlier_edges = [
+                edge
+                for edge in candidates
+                if outlier_id in (edge.left, edge.right)
+            ]
+            if outlier_edges:
+                candidates = outlier_edges
+        if not candidates:
+            break
         weakest = min(
             candidates, key=lambda item: (item.strength, item.method, item.left, item.right)
         )
@@ -657,11 +803,13 @@ def cluster_nodes(
             {
                 **_edge_dict(weakest),
                 "reason": "safety_edge_removed",
+                "violation": reason,
                 "removed_edge": {
                     "left": weakest.left,
                     "right": weakest.right,
                     "strength": weakest.strength,
                 },
+                **diagnostic,
             }
         )
         components = _Components(list(by_id))
@@ -711,7 +859,78 @@ def cluster_nodes(
     }
 
 
-def chunk_ownership_spans(chunks: list[ChunkWindow]) -> list[dict[str, Any]]:
+def _longest_silence_gap(
+    activity: np.ndarray, frame_hop: float
+) -> tuple[float, float] | None:
+    """Return (gap_start_frames, gap_end_frames) for the longest False run."""
+    if activity.size == 0 or np.all(activity):
+        return None
+    best_start = best_end = -1
+    cursor = 0
+    n_frames = int(activity.size)
+    while cursor < n_frames:
+        if activity[cursor]:
+            cursor += 1
+            continue
+        start = cursor
+        while cursor < n_frames and not activity[cursor]:
+            cursor += 1
+        if cursor - start > best_end - best_start:
+            best_start, best_end = start, cursor
+    if best_end <= best_start:
+        return None
+    return best_start * frame_hop, best_end * frame_hop
+
+
+def _min_activity_cut_offset(
+    activity: np.ndarray, frame_hop: float
+) -> float:
+    """Pick the lowest local-activity frame; ties break toward the midpoint."""
+    n_frames = int(activity.size)
+    if n_frames == 0:
+        return 0.0
+    if n_frames == 1:
+        return 0.0
+    # Soft local density: count active frames in a ±2-frame neighborhood.
+    radius = min(2, n_frames - 1)
+    padded = np.pad(activity.astype(np.int32), radius, mode="edge")
+    density = np.array(
+        [
+            int(np.sum(padded[index : index + 2 * radius + 1]))
+            for index in range(n_frames)
+        ],
+        dtype=np.int32,
+    )
+    midpoint = (n_frames - 1) / 2.0
+    best_index = min(
+        range(n_frames),
+        key=lambda index: (int(density[index]), abs(index - midpoint), index),
+    )
+    return best_index * frame_hop
+
+
+def _ownership_boundary(
+    overlap_start: float,
+    overlap_end: float,
+    activity_turns: list[Turn] | None,
+    frame_hop: float,
+) -> float:
+    midpoint = (overlap_start + overlap_end) / 2.0
+    if not activity_turns or overlap_end <= overlap_start:
+        return midpoint
+    activity = _paint(activity_turns, overlap_start, overlap_end, frame_hop)
+    silence = _longest_silence_gap(activity, frame_hop)
+    if silence is not None:
+        gap_start, gap_end = silence
+        return overlap_start + (gap_start + gap_end) / 2.0
+    return overlap_start + _min_activity_cut_offset(activity, frame_hop)
+
+
+def chunk_ownership_spans(
+    chunks: list[ChunkWindow],
+    activity_turns: list[Turn] | None = None,
+    frame_hop: float = 0.02,
+) -> list[dict[str, Any]]:
     spans = [
         {
             "chunk_index": index,
@@ -723,7 +942,11 @@ def chunk_ownership_spans(chunks: list[ChunkWindow]) -> list[dict[str, Any]]:
     for index in range(len(chunks) - 1):
         if chunks[index].end <= chunks[index + 1].start:
             continue
-        boundary = (chunks[index].end + chunks[index + 1].start) / 2
+        overlap_start = max(chunks[index].start, chunks[index + 1].start)
+        overlap_end = min(chunks[index].end, chunks[index + 1].end)
+        boundary = _ownership_boundary(
+            overlap_start, overlap_end, activity_turns, frame_hop
+        )
         spans[index]["end"] = float(boundary)
         spans[index + 1]["start"] = float(boundary)
     return spans
@@ -845,7 +1068,9 @@ def stitch_identities(
     mapping, cluster_metadata = cluster_nodes(
         nodes, adjacent_edges + embedding_edges, config
     )
-    ownership_spans = chunk_ownership_spans(chunks)
+    ownership_spans = chunk_ownership_spans(
+        chunks, moss_turns, config.frame_hop
+    )
     turns = reconcile_chunk_ownership(moss_turns, mapping, ownership_spans)
     exploded = detect_exploded_chunks(
         moss_turns, diarizen_turns, chunks, ownership_spans, config
@@ -903,7 +1128,7 @@ def stitch_identities(
             "diarizen_purity": float(node.anchor_purity),
         }
     metadata: dict[str, Any] = {
-        "version": "hierarchical_v1",
+        "version": "hierarchical_v2",
         "config": asdict(config),
         "assignments": assignments,
         "assignment_method": cluster_metadata["assignment_method"],

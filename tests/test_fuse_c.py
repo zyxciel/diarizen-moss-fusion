@@ -99,7 +99,7 @@ def test_mode_c_span_local_explosion_replaces_only_exploded_interval():
     _assert_no_cross_system_overlap(fused)
 
 
-def test_mode_c_split_moss_text_is_assigned_to_one_longest_fragment():
+def test_mode_c_split_moss_text_clears_all_fragments_for_retranscription():
     diarizen = [Turn(0.0, 10.0, "dz")]
     moss_stitched = [
         Turn(
@@ -121,8 +121,8 @@ def test_mode_c_split_moss_text_is_assigned_to_one_longest_fragment():
     assert [
         (t.start, t.end, t.text, t.asr_status, t.source) for t in moss_fragments
     ] == [
-        (0.0, 4.0, "say this once", AsrStatus.FINAL, Source.FUSED),
-        (6.0, 10.0, "", AsrStatus.EMPTY, Source.MOSS),
+        (0.0, 4.0, "", AsrStatus.NEEDS_RETRANSCRIBE, Source.MOSS),
+        (6.0, 10.0, "", AsrStatus.NEEDS_RETRANSCRIBE, Source.MOSS),
     ]
 
 

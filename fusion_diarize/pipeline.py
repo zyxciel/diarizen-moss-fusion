@@ -43,7 +43,7 @@ from fusion_diarize.types import ChunkWindow, DiarResult, Turn
 
 # Bump when chunk defaults change so stale work_dir caches are rebuilt.
 CHUNK_PLAN_VERSION = "20min_v1"
-IDENTITY_CACHE_VERSION = "hierarchical_v1"
+IDENTITY_CACHE_VERSION = "hierarchical_v2"
 PIPELINE_CACHE_VERSION = "pipeline_v1"
 
 
@@ -727,7 +727,9 @@ def run_pipeline(
                 "mapping": c_mapping,
             }
         else:
-            ownership_spans = chunk_ownership_spans(chunks)
+            ownership_spans = chunk_ownership_spans(
+                chunks, moss_turns, stitch_config.frame_hop
+            )
             exploded_chunks = detect_exploded_chunks(
                 moss_turns,
                 diarizen_turns,

@@ -192,7 +192,7 @@ def test_hungarian_masks_weak_and_invalid_pairs_before_assignment(monkeypatch):
         ("c0:b", "c1:y"): (0.0, 0.0),
     }
 
-    def fake_activity_iou(left, right, *_args):
+    def fake_activity_iou(left, right, *_args, **_kwargs):
         score, intersection = scores[(left[0].speaker_id, right[0].speaker_id)]
         return score, intersection, 1.0, 1.0
 
@@ -225,7 +225,11 @@ def test_accepted_hungarian_edge_reports_finite_margin():
             node("c1:c", 1, 0, 2),
         ],
         [ChunkWindow(0, 4), ChunkWindow(0, 4)],
-        StitchConfig(min_overlap_activity=0.5, min_intersection=0.5),
+        StitchConfig(
+            min_overlap_activity=0.5,
+            min_intersection=0.5,
+            overlap_mask_dilation=0.0,
+        ),
     )
     assert len(edges) == 1
     assert edges[0].assignment_margin == pytest.approx(0.5)
@@ -260,7 +264,9 @@ def test_anchor_uses_overlap_purity_duration_and_optional_embedding():
     assert anchored[0].anchor == "dz1"
     assert anchored[0].anchor_purity == pytest.approx(0.8)
     assert anchored[1].anchor == "dz1"  # no embedding does not reject temporal anchor
-    assert anchored[2].anchor is None  # insufficient overlap duration
+    # Short nodes use dynamic_min_overlap = min(3.0, activity * 0.6).
+    assert anchored[2].anchor == "dz1"
+    assert anchored[2].anchor_purity == pytest.approx(1.0)
 
 
 def test_anchor_purity_denominator_sums_all_diarizen_overlap():
@@ -290,8 +296,8 @@ def test_anchor_rejects_low_raw_centroid_cosine():
 
 def test_nonadjacent_embedding_link_and_ambiguous_or_weak_stay_separate():
     nodes = [
-        node("c0:a", 0, 0, 1, [1, 0]),
-        node("c2:a2", 2, 4, 5, [0.99, 0.01]),
+        node("c0:a", 0, 0, 1, [1, 0], "dz1"),
+        node("c2:a2", 2, 4, 5, [0.99, 0.01], "dz1"),
     ]
     edges, rejected = build_embedding_edges(nodes, StitchConfig())
     pairs = {frozenset((e.left, e.right)) for e in edges}
@@ -302,10 +308,10 @@ def test_nonadjacent_embedding_link_and_ambiguous_or_weak_stay_separate():
     assert math.isfinite(diagnostics["accepted_edges"][0]["assignment_margin"])
 
     ambiguous = [
-        node("c0:x", 0, 0, 1, [1, 0]),
-        node("c1:near", 1, 2, 3, [0.79, 0.613]),
-        node("c2:y", 2, 4, 5, [0.99, 0.01]),
-        node("c3:z", 3, 6, 7, [0.98, 0.02]),
+        node("c0:x", 0, 0, 1, [1, 0], "dz1"),
+        node("c1:near", 1, 2, 3, [0.79, 0.613], "dz1"),
+        node("c2:y", 2, 4, 5, [0.99, 0.01], "dz1"),
+        node("c3:z", 3, 6, 7, [0.98, 0.02], "dz1"),
     ]
     edges, rejected = build_embedding_edges(ambiguous, StitchConfig())
     pairs = {frozenset((e.left, e.right)) for e in edges}
@@ -317,6 +323,27 @@ def test_nonadjacent_embedding_link_and_ambiguous_or_weak_stay_separate():
     json.dumps(rejected)
 
 
+def test_embedding_edges_reject_both_no_anchor_and_long_distance_mismatch():
+    blind = [
+        node("c0:a", 0, 0, 1, [1, 0]),
+        node("c2:b", 2, 2, 3, [1, 0]),
+    ]
+    edges, rejected = build_embedding_edges(blind, StitchConfig())
+    assert edges == []
+    assert any(item["reason"] == "both_no_anchor" for item in rejected)
+
+    far = [
+        node("c0:a", 0, 0, 1, [1, 0], "dz1"),
+        node("c3:b", 3, 6, 7, [1, 0], "dz2"),
+    ]
+    edges, rejected = build_embedding_edges(far, StitchConfig())
+    assert edges == []
+    assert any(
+        item["reason"] == "long_distance_without_matching_anchors"
+        for item in rejected
+    )
+
+
 def test_embedding_margin_lookup_does_not_rescan_all_pairs_per_edge():
     source = inspect.getsource(build_embedding_edges)
     assert "for pair, other_cosine in similarities.items()" not in source
@@ -324,9 +351,9 @@ def test_embedding_margin_lookup_does_not_rescan_all_pairs_per_edge():
 
 def test_embedding_edges_exclude_adjacent_chunks():
     nodes = [
-        node("c0:a", 0, 0, 1, [1, 0]),
-        node("c1:b", 1, 2, 3, [1, 0]),
-        node("c2:c", 2, 4, 5, [1, 0]),
+        node("c0:a", 0, 0, 1, [1, 0], "dz1"),
+        node("c1:b", 1, 2, 3, [1, 0], "dz1"),
+        node("c2:c", 2, 4, 5, [1, 0], "dz1"),
     ]
     edges, rejected = build_embedding_edges(nodes, StitchConfig())
     assert all(abs(parse_chunk_index(edge.left) - parse_chunk_index(edge.right)) > 1 for edge in edges)
@@ -418,6 +445,32 @@ def test_cluster_rejects_abc_chaining_that_exceeds_diameter():
     assert merged["maximum_medoid_distance"] == pytest.approx(0.1, abs=1e-3)
 
 
+def test_cluster_centroid_outlier_cuts_weakest_outlier_edge():
+    # Pairwise diameter stays under 0.30, but c is far from the cluster centroid.
+    nodes = [
+        node("c0:a", 0, 0, 1, [1.0, 0.0]),
+        node("c1:b", 1, 2, 3, [0.98, 0.199]),
+        node("c2:c", 2, 4, 5, [0.8, 0.6]),
+    ]
+    edges = [
+        LinkEdge("c0:a", "c1:b", 0.99, "test"),
+        LinkEdge("c1:b", "c2:c", 0.90, "test"),
+        LinkEdge("c0:a", "c2:c", 0.88, "test"),
+    ]
+    mapping, metadata = cluster_nodes(
+        nodes,
+        edges,
+        StitchConfig(cluster_max_distance=0.30, centroid_outlier_distance=0.05),
+    )
+    assert mapping["c0:a"] == mapping["c1:b"]
+    assert mapping["c2:c"] != mapping["c0:a"]
+    assert any(
+        item.get("reason") in {"centroid_outlier", "safety_edge_removed"}
+        and item.get("outlier") == "c2:c"
+        for item in metadata["rejected_edges"]
+    )
+
+
 def test_final_ids_are_ordered_by_earliest_activity_then_local_id():
     nodes = [
         node("c2:z", 2, 5, 6),
@@ -457,6 +510,15 @@ def test_ownership_preserves_text_boundaries_and_multitalk():
     assert any(
         t.speaker_id == "speaker_1" and (t.start, t.end) == (9, 9.5) for t in out
     )
+
+
+def test_ownership_cuts_at_longest_silence_gap_in_overlap():
+    chunks = [ChunkWindow(0, 10), ChunkWindow(8, 18)]
+    # Speech at both ends of the overlap, silence around 8.8–9.4.
+    activity = [turn(8.0, 8.8, "c0:a"), turn(9.4, 10.0, "c1:b")]
+    spans = chunk_ownership_spans(chunks, activity, frame_hop=0.02)
+    assert spans[0]["end"] == pytest.approx(9.1, abs=0.05)
+    assert spans[1]["start"] == spans[0]["end"]
 
 
 def test_explosion_is_per_chunk_not_global_sum():
@@ -507,7 +569,7 @@ def test_end_to_end_result_has_json_safe_diagnostics_and_switch_count():
         StitchConfig(min_overlap_activity=0.5, min_intersection=0.5),
     )
     assert result.mapping["c0:a"] == result.mapping["c1:b"]
-    assert result.metadata["version"] == "hierarchical_v1"
+    assert result.metadata["version"] == "hierarchical_v2"
     assert result.metadata["assignment_method"] == "scipy_linear_sum_assignment"
     assert result.metadata["cross_chunk_identity_switch_count"] == 0
     assert result.metadata["ownership_spans"]
@@ -580,18 +642,20 @@ def test_default_stitch_config_is_strictly_json_safe():
 
 def test_stitch_config_normalizes_numpy_scalars_for_strict_json():
     defaults = asdict(StitchConfig())
+    int_fields = {"explosion_abs_cap", "long_distance_chunk_span"}
     config = StitchConfig(
         **{
             name: np.int64(value)
-            if name == "explosion_abs_cap"
+            if name in int_fields
             else np.float32(value)
             for name, value in defaults.items()
         }
     )
     assert type(config.explosion_abs_cap) is int
+    assert type(config.long_distance_chunk_span) is int
     assert all(
         type(getattr(config, name)) is float
         for name in defaults
-        if name != "explosion_abs_cap"
+        if name not in int_fields
     )
     json.dumps(asdict(config), allow_nan=False)

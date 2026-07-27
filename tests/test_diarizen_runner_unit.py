@@ -185,3 +185,36 @@ def test_embed_moss_labels_empty_input_does_not_load_audio(monkeypatch):
     monkeypatch.setattr(mod, "load_mono16k", fail_if_called)
 
     assert runner.embed_moss_labels("audio.wav", []) == {}
+
+
+def test_embed_moss_labels_excludes_overlapping_regions(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    regions: list[tuple[float, float]] = []
+
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(160000, dtype=np.float32), 16000),
+    )
+
+    def capture_region(_wav, start, end):
+        regions.append((start, end))
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(runner, "_embed_region", capture_region)
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [
+            Turn(0.0, 4.0, "speaker_0"),
+            Turn(2.0, 3.0, "speaker_1"),
+        ],
+    )
+
+    # Overlap [2,3] is impure for both speakers; speaker_1 has no clean residue.
+    assert "speaker_0" in pooled
+    assert "speaker_1" not in pooled
+    assert regions == [(0.0, 2.0), (3.0, 4.0)]

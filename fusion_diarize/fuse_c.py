@@ -76,18 +76,12 @@ def _moss_source(turn: Turn) -> Source:
 
 def _moss_fragments(turn: Turn, excluded: list[tuple[float, float]]) -> list[Turn]:
     fragments = _subtract_spans(turn, excluded)
+    # Explosion splits invalidate the original ASR text on every fragment —
+    # force downstream retranscription rather than keeping a longest-piece guess.
     if turn.text and len(fragments) > 1:
-        text_index = max(
-            range(len(fragments)),
-            key=lambda index: (
-                fragments[index].end - fragments[index].start,
-                -fragments[index].start,
-            ),
-        )
-        for index, fragment in enumerate(fragments):
-            if index != text_index:
-                fragment.text = ""
-                fragment.asr_status = AsrStatus.EMPTY
+        for fragment in fragments:
+            fragment.text = ""
+            fragment.asr_status = AsrStatus.NEEDS_RETRANSCRIBE
     for fragment in fragments:
         fragment.source = _moss_source(fragment)
     return fragments

@@ -164,7 +164,7 @@ def test_hierarchical_mode_c_cache_hit_skips_embedding(tmp_path: Path):
     first, first_diarizen, _ = _run(tmp_path)
     assert first_diarizen.embed_calls == 1
     cached = read_json(tmp_path / "work" / "identity_stitching.json")
-    assert cached.meta["version"] == "hierarchical_v1"
+    assert cached.meta["version"] == "hierarchical_v2"
     assert cached.meta["config"] == vars(StitchConfig())
     assert len(cached.meta["fingerprint"]) == 64
     assert isinstance(cached.meta["exploded_spans"], list)
@@ -511,7 +511,7 @@ def test_invalid_identity_strategy_rejected_before_work(tmp_path: Path):
         {"meta": {}, "turns": [None], "centroids": {}},
         {
             "meta": {
-                "version": "hierarchical_v1",
+                "version": "hierarchical_v2",
                 "config": vars(StitchConfig()),
                 "identity_stitching": {},
                 "mapping": ["not", "a", "mapping"],
@@ -567,7 +567,7 @@ def test_identity_cache_version_mismatch_recomputes_identity_only(
     assert diarizen.embed_calls == 1
     assert stitch_calls == 1
     assert moss.run_calls == 0
-    assert read_json(cache_path).meta["version"] == "hierarchical_v1"
+    assert read_json(cache_path).meta["version"] == "hierarchical_v2"
 
 
 def test_legacy_mode_c_falls_back_only_for_exploded_owned_chunk(

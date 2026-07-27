@@ -9,6 +9,7 @@ class AsrStatus(str, Enum):
     PROVISIONAL = "provisional"
     FINAL = "final"
     EMPTY = "empty"
+    NEEDS_RETRANSCRIBE = "needs_retranscribe"
 
 
 class Source(str, Enum):

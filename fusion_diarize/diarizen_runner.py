@@ -102,14 +102,51 @@ class DiariZenRunner:
             )
         return turns, cent
 
+    @staticmethod
+    def _clean_speech_intervals(
+        turn: Turn, all_turns: list[Turn]
+    ) -> list[tuple[float, float]]:
+        """Return single-speaker intervals for ``turn`` (overlap with others removed)."""
+        cuts = [
+            (other.start, other.end)
+            for other in all_turns
+            if other.speaker_id != turn.speaker_id
+            and other.end > turn.start
+            and other.start < turn.end
+        ]
+        if not cuts:
+            return [(turn.start, turn.end)] if turn.end > turn.start else []
+        cuts.sort()
+        merged: list[list[float]] = [[cuts[0][0], cuts[0][1]]]
+        for start, end in cuts[1:]:
+            if start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        clean: list[tuple[float, float]] = []
+        cursor = turn.start
+        for cut_start, cut_end in merged:
+            if cut_end <= cursor:
+                continue
+            if cut_start >= turn.end:
+                break
+            piece_end = min(cut_start, turn.end)
+            if piece_end - cursor > 1e-3:
+                clean.append((cursor, piece_end))
+            cursor = max(cursor, cut_end)
+            if cursor >= turn.end:
+                break
+        if turn.end - cursor > 1e-3:
+            clean.append((cursor, turn.end))
+        return clean
+
     def embed_moss_labels(
         self, audio_path: Path, moss_turns: list[Turn]
     ) -> dict[str, np.ndarray]:
-        """Duration-weight WeSpeaker embeddings over crops for each local label.
+        """Duration-weight WeSpeaker embeddings over **non-overlapping** crops.
 
-        Skips zero or nonfinite vectors so that pooling only includes valid
-        embeddings. Returns an empty dict when ``moss_turns`` is empty,
-        avoiding an unnecessary audio load.
+        Overlapping multi-speaker regions are excluded so pooled embeddings stay
+        speaker-pure. Skips zero/nonfinite vectors. Returns {} when empty.
         """
         if not moss_turns:
             return {}
@@ -118,15 +155,15 @@ class DiariZenRunner:
         by_label: dict[str, list[np.ndarray]] = {}
         durations: dict[str, list[float]] = {}
         for t in moss_turns:
-            emb = self._embed_region(wav, t.start, t.end)
-            # Skip invalid vectors so they do not affect the pooled embedding.
-            if np.all(np.isfinite(emb)) and np.any(emb != 0):
-                by_label.setdefault(t.speaker_id, []).append(emb)
-                i0 = max(0, int(round(t.start * sr)))
-                i1 = min(len(wav), int(round(t.end * sr)))
-                durations.setdefault(t.speaker_id, []).append(
-                    max((i1 - i0) / sr, 1e-3)
-                )
+            for start, end in self._clean_speech_intervals(t, moss_turns):
+                emb = self._embed_region(wav, start, end)
+                if np.all(np.isfinite(emb)) and np.any(emb != 0):
+                    by_label.setdefault(t.speaker_id, []).append(emb)
+                    i0 = max(0, int(round(start * sr)))
+                    i1 = min(len(wav), int(round(end * sr)))
+                    durations.setdefault(t.speaker_id, []).append(
+                        max((i1 - i0) / sr, 1e-3)
+                    )
         return {
             k: np.average(
                 np.stack(v, axis=0), axis=0, weights=durations[k]
