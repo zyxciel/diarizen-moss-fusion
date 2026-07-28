@@ -69,6 +69,19 @@ def _speaker_label(lab: Any) -> str:
     return s
 
 
+def _chunk_index_from_speaker_id(speaker_id: str) -> int | None:
+    """Extract chunk index from namespaced MOSS labels like ``c000:S01``."""
+    if ":" not in speaker_id:
+        return None
+    prefix, _rest = speaker_id.split(":", 1)
+    if len(prefix) < 2 or not prefix.startswith("c"):
+        return None
+    digits = prefix[1:]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
 class DiariZenRunner:
     """Lazy-loads DiariZen hub model; exposes turns + centroids + crop embeds."""
 
@@ -154,8 +167,21 @@ class DiariZenRunner:
         assert sr == 16000
         by_label: dict[str, list[np.ndarray]] = {}
         durations: dict[str, list[float]] = {}
+        turns_by_chunk: dict[int, list[Turn]] = {}
+        turns_without_chunk: list[Turn] = []
+        for turn in moss_turns:
+            chunk_index = _chunk_index_from_speaker_id(turn.speaker_id)
+            if chunk_index is None:
+                turns_without_chunk.append(turn)
+            else:
+                turns_by_chunk.setdefault(chunk_index, []).append(turn)
         for t in moss_turns:
-            for start, end in self._clean_speech_intervals(t, moss_turns):
+            chunk_index = _chunk_index_from_speaker_id(t.speaker_id)
+            if chunk_index is None:
+                reference_turns = turns_without_chunk
+            else:
+                reference_turns = turns_by_chunk.get(chunk_index, [t])
+            for start, end in self._clean_speech_intervals(t, reference_turns):
                 emb = self._embed_region(wav, start, end)
                 if np.all(np.isfinite(emb)) and np.any(emb != 0):
                     by_label.setdefault(t.speaker_id, []).append(emb)

@@ -218,3 +218,45 @@ def test_embed_moss_labels_excludes_overlapping_regions(monkeypatch):
     assert "speaker_0" in pooled
     assert "speaker_1" not in pooled
     assert regions == [(0.0, 2.0), (3.0, 4.0)]
+
+
+def test_embed_moss_labels_does_not_subtract_overlaps_from_other_chunks(monkeypatch):
+    import fusion_diarize.diarizen_runner as mod
+    from fusion_diarize.types import Turn
+
+    runner = object.__new__(mod.DiariZenRunner)
+    regions: list[tuple[str, float, float]] = []
+
+    monkeypatch.setattr(
+        mod,
+        "load_mono16k",
+        lambda _: (np.zeros(160000, dtype=np.float32), 16000),
+    )
+
+    def capture_region(_wav, start, end):
+        regions.append((current_turn[0], start, end))
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(runner, "_embed_region", capture_region)
+    original_clean = runner._clean_speech_intervals
+    current_turn = [""]
+
+    def wrapped_clean(turn, all_turns):
+        current_turn[0] = turn.speaker_id
+        return original_clean(turn, all_turns)
+
+    monkeypatch.setattr(runner, "_clean_speech_intervals", wrapped_clean)
+
+    pooled = runner.embed_moss_labels(
+        "audio.wav",
+        [
+            Turn(0.0, 4.0, "c000:S00"),
+            Turn(0.0, 4.0, "c001:S03"),
+        ],
+    )
+
+    assert set(pooled) == {"c000:S00", "c001:S03"}
+    assert sorted(regions) == [
+        ("c000:S00", 0.0, 4.0),
+        ("c001:S03", 0.0, 4.0),
+    ]
